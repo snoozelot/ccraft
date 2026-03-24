@@ -55,8 +55,8 @@ no()  { [[ -z $1 ]]; }
 
 has_flag()        { [[ ${1:-} == -* ]]; }
 is_stdin()        { [[ $FILE_C == "/dev/stdin" ]]; }
-is_verbose()      { [[ $V_FLAG -ge 1 ]]; }
-is_very_verbose() { [[ $V_FLAG -ge 2 ]]; }
+wants_trace()     { [[ $V_FLAG -ge 1 ]]; }
+wants_source()    { [[ $V_FLAG -ge 2 ]]; }
 binary_missing()  { [[ ! -x $OUT ]]; }
 source_newer()    { [[ $FILE_C -nt $OUT ]]; }
 
@@ -189,7 +189,7 @@ if needs_recompile; then
     # - Provide accurate line numbers in error messages
     sed "1 s|^#!.*|#line 2 \"$FILE_C\"|" < "$FILE_C" > "$SCOPED_C"
 
-    if is_very_verbose; then
+    if wants_source; then
         bat --language=C --number --paging=never "$SCOPED_C"  1>&2 2>/dev/null ||
         cat -vn "$SCOPED_C" 1>&2 2>/dev/null
     fi
@@ -216,7 +216,7 @@ if needs_recompile; then
         "${CC_FLAGS_USER[@]}"
     )
 
-    is_verbose && set -x
+    wants_trace && set -x
 
     # LD_FLAGS after source for proper symbol resolution
     "${CC-cc}" "${CC_FLAGS[@]}" -o"$OUT" "$SCOPED_C" "${LD_FLAGS_USER[@]}" >&2
@@ -224,7 +224,7 @@ fi
 
 # Reset xtrace, re-enable if verbose
 { set +x; } 2>/dev/null
-is_verbose && set -x
+wants_trace && set -x
 
 # Execute the compiled binary with remaining arguments, overriding argv[0] to FILE_C
 # Use subshell to preserve cleanup trap
