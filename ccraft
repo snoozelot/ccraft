@@ -1,0 +1,234 @@
+#!/usr/bin/env bash
+#
+# RATIONALE
+# Just-in-time compilation for C code, making it essentially a scripting language.
+# Including header-only libraries that don't require linking is encouraged.
+# Works as a shebang interpreter, allowing C files to be executed directly.
+#
+# Supports three caching strategies via CCRAFT_CACHE environment variable:
+#   mtime (default) - Recompile when source is newer than binary (fastest)
+#   md5             - Recompile when content hash changes (most correct)
+#   none            - Always recompile (slowest, always fresh)
+#
+# C99 Standard Headers, for reference:
+#include <assert.h>
+#include <complex.h>
+#include <ctype.h>
+#include <errno.h>
+#include <fenv.h>
+#include <float.h>
+#include <inttypes.h>
+#include <limits.h>
+#include <stdint.h>
+#include <locale.h>
+#include <math.h>
+#include <setjmp.h>
+#include <signal.h>
+#include <stdarg.h>
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <tgmath.h>
+#include <time.h>
+#include <wchar.h>
+#include <wctype.h>
+#
+# Additional headers:
+#include <iso646.h>      /* see https://en.wikipedia.org/wiki/C_alternative_tokens */
+#include <unistd.h>      /* POSIX system calls (fork, exec, read, write, etc.) */
+#include <sys/types.h>   /* Basic system types (pid_t, size_t, off_t, etc.) */
+#include <sys/stat.h>    /* File status and permissions */
+#include <fcntl.h>       /* File control options */
+#
+set -e
+
+# ============================================================================
+# Helpers
+# ============================================================================
+
+SCRIPT=${0##*/}
+
+die() { echo "${SCRIPT}: $*" >&2; exit 1; }
+no()  { [[ -z $1 ]]; }
+
+has_flag()        { [[ ${1:-} == -* ]]; }
+is_stdin()        { [[ $FILE_C == "/dev/stdin" ]]; }
+is_verbose()      { [[ $V_FLAG -ge 1 ]]; }
+is_very_verbose() { [[ $V_FLAG -ge 2 ]]; }
+binary_missing()  { [[ ! -x $OUT ]]; }
+source_newer()    { [[ $FILE_C -nt $OUT ]]; }
+
+# ============================================================================
+# Usage
+# ============================================================================
+
+usage() {
+    cat <<EOS
+Usage: ${SCRIPT} [CC_FLAG]... FILE_C [ARG]...
+
+Compile FILE_C and execute it with ARGs as arguments, using just-in-time compilation.
+Essentially, a wrapper around CC with shebang interpreter support.
+When FILE_C is /dev/stdin, then your current working directory will be added as compiler include path.
+When FILE_C is a regular file, then its directory will be added as compiler include path.
+
+CC_FLAGs:
+  -v          Show compilation command
+  -vv         Show compilation command and source code
+  -std=STD    Override gnu99 as C standard with STD
+  -o FILE     Create persistent binary FILE instead of ephemeral one
+  -p MODULE   Link against pkg-config MODULE, e.g. -p freetype2
+  ...         Any other flags supported by CC, like \${CFLAGS} or \${LDFLAGS}
+
+Environment:
+  CC            = ${CC-cc}
+  CCRAFT_CACHE  = ${CCRAFT_CACHE-mtime}  (mtime|md5|none)
+
+Caching strategies:
+  mtime   Recompile when source newer than binary (default, fastest)
+  md5     Recompile when content hash changes (handles reverts correctly)
+  none    Always recompile (no cache)
+
+Examples:
+  ${SCRIPT} -lm calc.c "2 + 3"
+  ${SCRIPT} -vv -p SDL2 game.c
+  cat hello.c | ${SCRIPT} -vv /dev/stdin
+
+EOS
+}
+
+# ============================================================================
+# Main
+# ============================================================================
+
+V_FLAG=0
+STD_FLAG="-std=gnu99"
+CC_FLAGS_USER=()
+LD_FLAGS_USER=()
+OUT=""
+CLEANUP=()
+CACHE_MODE=${CCRAFT_CACHE-mtime}
+
+while has_flag "$1"; do
+    case $1 in
+        -v)     ((V_FLAG+=1));   shift   ;;
+        -vv)    ((V_FLAG+=2));   shift   ;;
+        -std=*) STD_FLAG=$1;     shift   ;;
+        -o)     OUT=$2;          shift 2 ;;
+        -o*)    OUT=${1#-o};     shift   ;;
+        -p)     CC_FLAGS_USER+=($( pkg-config --cflags "$2" ))
+                LD_FLAGS_USER+=($( pkg-config --libs "$2" ))
+                                 shift 2 ;;
+        -p*)    CC_FLAGS_USER+=($( pkg-config --cflags "${1#-p}" ))
+                LD_FLAGS_USER+=($( pkg-config --libs "${1#-p}" ))
+                                 shift   ;;
+        -l*)    LD_FLAGS_USER+=("$1"); shift ;;
+        *)      CC_FLAGS_USER+=("$1"); shift ;;
+    esac
+done
+
+[[ -r ${1:-} ]] || { usage; exit 1; }
+FILE_C=$1; shift
+
+# For stdin, save to temp file (avoid consuming multiple times),
+# but keep FILE="stdin" for deterministic cache paths
+if is_stdin; then
+    FILE_C="${TMPDIR-/tmp}/stdin-$$.c"
+    cat > "$FILE_C"
+    CLEANUP+=("$FILE_C")
+    [[ -s $FILE_C ]] || die "stdin is empty"
+    FILE="stdin"
+else
+    # Extract basename, remove .c/.t extension for scoped filenames
+    FILE=${FILE_C##*/}
+    FILE=${FILE%.[ct]}
+fi
+
+# Cache: scope_id varies by strategy (md5=content, mtime=path, none=random)
+scope_id() {
+    case $CACHE_MODE in
+        md5)   { id -u;
+                 cat "$FILE_C";
+               } | md5sum | head -c8 ;;
+        mtime) { id -u;
+                 readlink -f "$FILE_C" 2>/dev/null || echo "$FILE_C";
+               } | md5sum | head -c8 ;;
+        none)  printf '%s' "$$-$RANDOM" ;;
+    esac
+}
+
+SCOPE_ID=$(scope_id)
+SCOPED_C="${TMPDIR-/tmp}/${FILE}-${SCOPE_ID}.c"
+SCOPED_OUT=${SCOPED_C%.c}
+
+no "$OUT" && OUT=$SCOPED_OUT
+
+needs_recompile() {
+    case $CACHE_MODE in
+        none)  return 0 ;;
+        mtime) binary_missing || source_newer ;;
+        md5)   binary_missing ;;
+    esac
+}
+
+# Include dir: source file's directory, or cwd for stdin (which was saved to temp)
+include_dir() {
+    local REAL
+
+    REAL=$(readlink -f "$FILE_C" 2>/dev/null || echo "$FILE_C")
+    [[ $FILE == "stdin" ]] && pwd || dirname "$REAL"
+}
+
+if needs_recompile; then
+    CLEANUP+=("$SCOPED_C")
+    trap 'rm -f -- "${CLEANUP[@]}"' EXIT
+
+    # Replace shebang with #line pragma to:
+    # - Avoid unknown pragma warnings (shebang is not valid C)
+    # - Provide accurate line numbers in error messages
+    sed "1 s|^#!.*|#line 2 \"$FILE_C\"|" < "$FILE_C" > "$SCOPED_C"
+
+    if is_very_verbose; then
+        bat --language=C --number --paging=never "$SCOPED_C"  1>&2 2>/dev/null ||
+        cat -vn "$SCOPED_C" 1>&2 2>/dev/null
+    fi
+
+    # Build complete compiler flags array
+    CC_FLAGS=(
+        # Language standard
+        "$STD_FLAG"
+
+        # Core compiler flags for optimal compilation speed
+        -O0                        # Disable optimizations to reduce compile time
+        -pipe                      # Use pipes instead of temporary files during compilation
+        -I"$(include_dir)"         # Include directory of C file for header files
+
+        # Warning flags for better code quality
+        -Wall                      # Enable all common warnings
+        -Wextra                    # Enable extra warnings not covered by -Wall
+        -Wno-unused                # Suppress all unused warnings
+
+        # Core linker flags for optimal performance
+        -Wl,-O0                    # Disable linker optimizations for faster linking
+
+        # User CLI overrides
+        "${CC_FLAGS_USER[@]}"
+    )
+
+    is_verbose && set -x
+
+    # LD_FLAGS after source for proper symbol resolution
+    "${CC-cc}" "${CC_FLAGS[@]}" -o"$OUT" "$SCOPED_C" "${LD_FLAGS_USER[@]}" >&2
+fi
+
+# Reset xtrace, re-enable if verbose
+{ set +x; } 2>/dev/null
+is_verbose && set -x
+
+# Execute the compiled binary with remaining arguments, overriding argv[0] to FILE_C
+# Use subshell to preserve cleanup trap
+(exec -a "$FILE_C" "$OUT" "$@")
+
+# Explicit exit, for xtrace to log the actual exit status
+exit $?
