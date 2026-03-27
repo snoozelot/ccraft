@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+# clint - C syntax checker and linter
+#
+# Runs gcc in syntax-only mode with strict warnings.
+# Ignores #! shebang on first line (for ccraft scripts).
+# No object files produced, just diagnostics.
+#
+# Usage:
+#   clint [GCC_OPTIONS] FILE...
+#
+# Examples:
+#   clint foo.c
+#   clint -Wpedantic *.c
+
+OPTS=()
+FILES=()
+
+for ARG in "$@"; do
+    [[ $ARG == -* ]] && OPTS+=("$ARG") || FILES+=("$ARG")
+done
+
+for FILE in "${FILES[@]}"; do
+    sed "1 { s|^#!.*|#line 2 \"${FILE}\"|; t; s|^|#line 1 \"${FILE}\"\n| }" "$FILE" \
+    | gcc -fsyntax-only -Wall -Wextra "${OPTS[@]}" -x c -
+done

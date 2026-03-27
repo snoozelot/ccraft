@@ -72,6 +72,11 @@ Set `CCRAFT_CACHE` environment variable:
 
 The `hi-*.c` files are self-contained templates to embed in your project without ccraft dependency.
 
+## Companion Tools
+
+- `clint` — lint ccraft scripts with gcc syntax-only mode
+- `cproto` — extract function prototypes using clang AST
+
 ## Dependencies
 
 - C compiler (`cc` or `$CC`)
@@ -80,4 +85,4 @@ The `hi-*.c` files are self-contained templates to embed in your project without
 
 ## Install
 
-Copy `ccraft` to your PATH.
+Copy `ccraft` to your PATH. See `examples/` for demos.
