@@ -74,6 +74,7 @@ The `hi-*.c` files are self-contained templates to embed in your project without
 
 ## Companion Tools
 
+- `ccompile` — batch compile C files, chronic-style output (quiet on success)
 - `clint` — lint ccraft scripts with gcc syntax-only mode
 - `cproto` — extract function prototypes using clang AST
 
