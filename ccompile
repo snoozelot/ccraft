@@ -52,18 +52,20 @@ parse_flags() {
 
 compile() {
     SRC=$1 OUT=$2
-    TMP=$(mktemp)
+    TOUT=$(mktemp)
+    TERR=$(mktemp)
     FLAGS=$(parse_flags "$SRC")
 
     if is_verbose; then echo "$CC $CFLAGS $FLAGS -o $OUT $SRC ${LDFLAGS:-}" >&2; fi
 
-    if $CC $CFLAGS $FLAGS -o "$OUT" "$SRC" ${LDFLAGS:-} >"$TMP" 2>&1; then
-        rm -f "$TMP"
+    if $CC $CFLAGS $FLAGS -o "$OUT" "$SRC" ${LDFLAGS:-} >"$TOUT" 2>"$TERR"; then
+        rm -f "$TOUT" "$TERR"
         return 0
     fi
     echo "=== FAILED: $SRC ===" >&2
-    cat "$TMP" >&2
-    rm -f "$TMP"
+    cat "$TOUT"
+    cat "$TERR" >&2
+    rm -f "$TOUT" "$TERR"
     return 1
 }
 
