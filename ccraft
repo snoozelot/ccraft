@@ -112,6 +112,7 @@ CACHE_MODE=${CCRAFT_CACHE-mtime}
 
 while has_flag "$1"; do
     case $1 in
+        --)     shift; break    ;;
         -v)     ((V_FLAG+=1));   shift   ;;
         -vv)    ((V_FLAG+=2));   shift   ;;
         -std=*) STD_FLAG=$1;     shift   ;;
