@@ -118,11 +118,11 @@ while has_flag "$1"; do
         -std=*) STD_FLAG=$1;     shift   ;;
         -o)     OUT=$2;          shift 2 ;;
         -o*)    OUT=${1#-o};     shift   ;;
-        -p)     CC_FLAGS_USER+=($( pkg-config --cflags "$2" ))
-                LD_FLAGS_USER+=($( pkg-config --libs "$2" ))
+        -p)     mapfile -t -O ${#CC_FLAGS_USER[@]} CC_FLAGS_USER < <(pkg-config --cflags "$2")
+                mapfile -t -O ${#LD_FLAGS_USER[@]} LD_FLAGS_USER < <(pkg-config --libs "$2")
                                  shift 2 ;;
-        -p*)    CC_FLAGS_USER+=($( pkg-config --cflags "${1#-p}" ))
-                LD_FLAGS_USER+=($( pkg-config --libs "${1#-p}" ))
+        -p*)    mapfile -t -O ${#CC_FLAGS_USER[@]} CC_FLAGS_USER < <(pkg-config --cflags "${1#-p}")
+                mapfile -t -O ${#LD_FLAGS_USER[@]} LD_FLAGS_USER < <(pkg-config --libs "${1#-p}")
                                  shift   ;;
         -l*)    LD_FLAGS_USER+=("$1"); shift ;;
         *)      CC_FLAGS_USER+=("$1"); shift ;;
@@ -211,7 +211,7 @@ if needs_recompile; then
         -Wno-unused                # Suppress all unused warnings
 
         # Core linker flags for optimal performance
-        -Wl,-O0                    # Disable linker optimizations for faster linking
+        -Wl,-O1                    # Minimal linker optimization (portable across GNU ld, lld, mold)
 
         # User CLI overrides
         "${CC_FLAGS_USER[@]}"
