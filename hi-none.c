@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # hi-none.c - Always recompile (no caching)
 FILE="${0}"
-CC_FLAGS=(-std=gnu99 -O0 -pipe -I"$(dirname "$(readlink -f "${FILE}")")" -Wall -Wextra -Wno-unused -Wl,-O0)
+CC_FLAGS=(-std=gnu99 -O0 -pipe -I"$(dirname "$(readlink -f "${FILE}")")" -Wall -Wextra -Wno-unused)
 TEMP_C="$(mktemp "${TMPDIR-/tmp}/XXX.c")"
 OUT="${TEMP_C%.c}"
 trap 'rm -f -- "${TEMP_C}" "${OUT}"' EXIT

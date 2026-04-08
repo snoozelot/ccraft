@@ -5,7 +5,7 @@ BASE="${FILE##*/}"
 SCOPE_ID=$({ id -u; cat "${FILE}"; } | md5sum | head -c8)
 TEMP_C="${TMPDIR-/tmp}/${BASE%.c}-${SCOPE_ID}.c"
 OUT="${TEMP_C%.c}"
-CC_FLAGS=(-std=gnu99 -O0 -pipe -I"$(dirname "$(readlink -f "${FILE}")")" -Wall -Wextra -Wno-unused -Wl,-O0)
+CC_FLAGS=(-std=gnu99 -O0 -pipe -I"$(dirname "$(readlink -f "${FILE}")")" -Wall -Wextra -Wno-unused)
 
 if [[ ! -x "${OUT}" ]]; then
     trap 'rm -f -- "${TEMP_C}"' EXIT
