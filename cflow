@@ -1,0 +1,378 @@
+#!/usr/bin/env bash
+# cflow — show the function call tree of C source
+#
+# WHAT IT DOES
+# Prints the function call tree of C source in two directions:
+#
+#   Forward (-r): starting from a root function, shows what it calls,
+#   transitively. Each function appears fully once; subsequent occurrences
+#   are marked [...] to avoid repetition.
+#
+#   Reverse (-R): starting from a target function, shows who calls it,
+#   transitively. Useful for answering "where does this function get called?"
+#
+# WHY
+# GNU cflow uses its own C parser — it fails on preprocessor-heavy code and
+# modern declarations. This tool uses clang's full AST, so it handles
+# anything clang compiles.
+#
+# LIMITATION
+# Function pointers are not resolved. Indirect calls appear as leaf nodes.
+# The targets are runtime values; static analysis cannot resolve them. Use
+# runtime profiling (callgrind) or source annotations for pointer resolution.
+#
+# If the same function name appears in multiple source files (e.g., two files
+# each defining a static helper named "init"), the last file processed wins
+# and the earlier definition's call graph is silently lost.
+#
+# Tree depth is capped at 99 even without -d, as a safety ceiling against
+# runaway recursion on pathological graphs. Pass -d to lower it explicitly.
+#
+# HOW IT WORKS
+# 1. clang -ast-dump=json — parses each source file into an AST
+# 2. jq — for each function definition, collects all direct callees and
+#    emits one record: name, source location, comma-separated callee names
+# 3. bash — loads the call graph into associative arrays; for reverse mode,
+#    inverts the graph; renders an indented tree, tracking already-expanded
+#    functions and ancestor paths to detect repetition and recursion
+#
+# USAGE
+#   cflow [OPTIONS] FILE...
+#
+# OPTIONS
+#   -r FN     forward tree: show what FN calls (default: main)
+#   -R FN     reverse tree: show who calls FN
+#   -d N      max depth (default: unlimited)
+#   -D NAME   preprocessor define
+#   -I DIR    add include directory
+#   -h        show this help
+#
+# EXAMPLES
+#   # Forward tree from main (default)
+#   cflow examples/calltree.c
+#   → main() <examples/calltree.c:56>
+#         factorial() <examples/calltree.c:47>
+#             factorial() [recursive]
+#         printf()
+#         process() <examples/calltree.c:38>
+#             transform() <examples/calltree.c:32>
+#             validate() <examples/calltree.c:26>
+#
+#   # Reverse tree: who calls validate?
+#   cflow -R validate examples/calltree.c
+#   → validate() <examples/calltree.c:26>
+#         process() <examples/calltree.c:38>
+#             main() <examples/calltree.c:56>
+#
+#   # Real usage
+#   cflow src/*.c
+#   cflow -r init -d 3 src/*.c
+#   cflow -R pthread_mutex_lock src/*.c
+#
+# EXIT CODES
+#   0   success
+#   1   root function not found, or file error
+#
+# DEPENDENCIES
+#   clang, jq
+
+set -euo pipefail
+
+# ── configuration ─────────────────────────────────────────────────────────────
+
+readonly DEFAULT_ROOT=main
+readonly NO_DEPTH_LIMIT=99     # safety ceiling; prevents runaway on pathological graphs
+
+ROOT=
+REVERSE=
+MAX_DEPTH=$NO_DEPTH_LIMIT
+DEFINES=()
+INCLUDES=()
+CLEANUP_FILES=()
+
+declare -A FUNC_LOC      # function name → file:line
+declare -A FUNC_CALLS    # function name → comma-separated callees
+declare -A FUNC_CALLERS  # function name → comma-separated callers
+declare -A EXPANDED      # functions already rendered in this tree
+
+# ── infrastructure ────────────────────────────────────────────────────────────
+
+die()  { echo "cflow: $*" >&2; exit 1; }
+warn() { echo "cflow: $*" >&2; }
+
+cleanup() {
+    local F
+    for F in "${CLEANUP_FILES[@]+"${CLEANUP_FILES[@]}"}"; do
+        rm -f "$F"
+    done
+}
+trap cleanup EXIT
+
+create_tempfile() {
+    local T
+    T=$(mktemp)
+    CLEANUP_FILES+=("$T")
+    echo "$T"
+}
+
+# ── predicates ────────────────────────────────────────────────────────────────
+
+got()           { [[ -n $1 ]]; }
+has_arguments() { [[ $# -gt 0 ]]; }
+file_exists()   { [[ -f "$1" ]]; }
+is_defined()    { [[ -v FUNC_LOC[$1] ]]; }
+is_expanded()   { [[ -v EXPANDED[$1] ]]; }
+has_callers()   { [[ -v FUNC_CALLERS[$1] ]]; }
+within_depth()  { [[ $1 -lt $MAX_DEPTH ]]; }
+is_ancestor()   { [[ ":$2:" == *":$1:"* ]]; }
+is_reverse()    { [[ -n "$REVERSE" ]]; }
+is_numeric()    { [[ $1 =~ ^[0-9]+$ ]]; }
+
+# ── usage ─────────────────────────────────────────────────────────────────────
+
+usage() {
+    read -r -d '' MSG <<'EOF' || :
+Usage: cflow [OPTIONS] FILE...
+
+Show the function call tree of C source.
+
+Options:
+  -r FN     forward tree: show what FN calls (default: main)
+  -R FN     reverse tree: show who calls FN
+  -d N      max depth (default: unlimited)
+  -D NAME   preprocessor define
+  -I DIR    include directory
+  -h        help
+
+Examples:
+  cflow src/*.c
+  cflow -r init src/*.c
+  cflow -R pthread_mutex_lock src/*.c
+  cflow -d 3 src/*.c
+EOF
+    echo "$MSG"
+}
+
+# ── AST ───────────────────────────────────────────────────────────────────────
+
+ast_json() {
+    clang -x c -fsyntax-only -Xclang -ast-dump=json \
+        ${DEFINES[@]+"${DEFINES[@]}"} \
+        ${INCLUDES[@]+"${INCLUDES[@]}"} \
+        "$1" 2>/dev/null
+}
+
+# ── call graph extraction ─────────────────────────────────────────────────────
+
+# Emit one record per function definition in FILE:
+# FUNCTION TAB FILE:LINE TAB CALLEE1,CALLEE2,...
+call_graph_in() {
+    local FILE=$1
+
+    ast_json "$FILE" | jq -r --arg file "$FILE" '
+        def is_function_definition:
+            .kind == "FunctionDecl"
+            and (.name != null) and (.name != "")
+            and any(.inner[]?; .kind == "CompoundStmt");
+
+        def is_from_source_file:
+            .loc.includedFrom | not;
+
+        def direct_callees:
+            [.. | select(.kind? == "CallExpr")
+                | first(.inner[0] | .. |
+                    select(.kind? == "DeclRefExpr") |
+                    .referencedDecl?.name?) // null
+            ] | map(select(. != null)) | unique;
+
+        .inner[]?
+        | select(is_function_definition)
+        | select(is_from_source_file)
+        | [
+            .name,
+            ($file + ":" + ((.loc.line // 0) | tostring)),
+            (direct_callees | join(","))
+          ]
+        | join("\t")
+    '
+}
+
+load_call_graph() {
+    local ALL_RECORDS=$1
+    local NAME
+    local LOC
+    local CALLEES
+
+    while IFS=$'\t' read -r NAME LOC CALLEES; do
+        FUNC_LOC[$NAME]=$LOC
+        FUNC_CALLS[$NAME]=$CALLEES
+    done < "$ALL_RECORDS"
+}
+
+# ── graph inversion ───────────────────────────────────────────────────────────
+
+# Record CALLER as a caller of CALLEE (append if already has callers).
+add_caller() {
+    local CALLEE=$1
+    local CALLER=$2
+
+    if has_callers "$CALLEE"; then
+        FUNC_CALLERS[$CALLEE]="${FUNC_CALLERS[$CALLEE]},${CALLER}"
+    else
+        FUNC_CALLERS[$CALLEE]=$CALLER
+    fi
+}
+
+# Invert FUNC_CALLS into FUNC_CALLERS: for each callee, record who calls it.
+build_inverse_graph() {
+    local CALLER
+    local CALLEE
+    local -a CALLEE_LIST
+
+    for CALLER in "${!FUNC_CALLS[@]}"; do
+        IFS=',' read -ra CALLEE_LIST <<< "${FUNC_CALLS[$CALLER]}"
+        for CALLEE in "${CALLEE_LIST[@]}"; do
+            add_caller "$CALLEE" "$CALLER"
+        done
+    done
+}
+
+# ── tree rendering ────────────────────────────────────────────────────────────
+
+# Handles node entry for both forward and reverse traversal.
+# Prints the node with the appropriate marker ([recursive], [...], or none).
+# Returns 0 if recursion should continue, 1 if this branch is complete.
+enter_node() {
+    local FN=$1
+    local DEPTH=$2
+    local ANCESTORS=$3
+    local INDENT
+    INDENT=$(indent_for "$DEPTH")
+
+    if is_ancestor "$FN" "$ANCESTORS"; then
+        print_function "$FN" "$INDENT" "[recursive]"
+        return 1
+    fi
+    if is_expanded "$FN"; then
+        print_function "$FN" "$INDENT" "[...]"
+        return 1
+    fi
+    print_function "$FN" "$INDENT" ""
+    EXPANDED[$FN]=1
+    within_depth "$DEPTH"
+}
+
+indent_for() {
+    local DEPTH=$1
+    printf '%*s' $((DEPTH * 4)) ''
+}
+
+# Print one line: name, location (if defined), and optional marker.
+print_function() {
+    local FN=$1
+    local INDENT=$2
+    local MARKER=$3
+
+    if is_defined "$FN"; then
+        printf '%s%s() <%s>%s\n' "$INDENT" "$FN" "${FUNC_LOC[$FN]}" "${MARKER:+ $MARKER}"
+    else
+        printf '%s%s()%s\n' "$INDENT" "$FN" "${MARKER:+ $MARKER}"
+    fi
+}
+
+# Forward tree: print FN and what it calls, transitively.
+render_tree() {
+    local FN=$1
+    local DEPTH=$2
+    local ANCESTORS=$3
+    local CALLEES
+    local NEXT
+    local CALLEE
+    local -a CALLEE_LIST
+
+    is_defined "$FN" || { print_function "$FN" "$(indent_for "$DEPTH")" ""; return 0; }
+    enter_node "$FN" "$DEPTH" "$ANCESTORS" || return 0
+
+    CALLEES=${FUNC_CALLS[$FN]:-}
+    got "$CALLEES" || return 0
+
+    NEXT=${ANCESTORS:+${ANCESTORS}:}${FN}
+    IFS=',' read -ra CALLEE_LIST <<< "$CALLEES"
+    for CALLEE in "${CALLEE_LIST[@]}"; do
+        render_tree "$CALLEE" $((DEPTH + 1)) "$NEXT"
+    done
+}
+
+# Reverse tree: print FN and who calls it, transitively.
+render_callers() {
+    local FN=$1
+    local DEPTH=$2
+    local ANCESTORS=$3
+    local CALLERS
+    local NEXT
+    local CALLER
+    local -a CALLER_LIST
+
+    enter_node "$FN" "$DEPTH" "$ANCESTORS" || return 0
+
+    CALLERS=${FUNC_CALLERS[$FN]:-}
+    got "$CALLERS" || return 0
+
+    NEXT=${ANCESTORS:+${ANCESTORS}:}${FN}
+    IFS=',' read -ra CALLER_LIST <<< "$CALLERS"
+    for CALLER in "${CALLER_LIST[@]}"; do
+        render_callers "$CALLER" $((DEPTH + 1)) "$NEXT"
+    done
+}
+
+# ── main ──────────────────────────────────────────────────────────────────────
+
+main() {
+    local OPT
+    local FILE
+    local ALL_RECORDS
+    local OUTPUT
+
+    while getopts ":r:R:d:D:I:h-" OPT; do
+        case "$OPT" in
+            r) ROOT=$OPTARG; REVERSE= ;;
+            R) ROOT=$OPTARG; REVERSE=1 ;;
+            d) is_numeric "$OPTARG" || die "invalid depth: $OPTARG"
+               MAX_DEPTH=$OPTARG ;;
+            D) DEFINES+=("-D$OPTARG") ;;
+            I) INCLUDES+=("-I$OPTARG") ;;
+            h) usage; exit 0 ;;
+            -) break ;;
+            *) usage >&2; exit 1 ;;
+        esac
+    done
+    shift $((OPTIND - 1))
+    [[ "${1:-}" == "--" ]] && shift
+
+    has_arguments "$@" || { usage >&2; exit 1; }
+    got "$ROOT" || ROOT=$DEFAULT_ROOT
+
+    ALL_RECORDS=$(create_tempfile)
+
+    for FILE in "$@"; do
+        file_exists "$FILE" || { warn "not found: $FILE"; continue; }
+        if OUTPUT=$(call_graph_in "$FILE"); then
+            got "$OUTPUT" && echo "$OUTPUT" >> "$ALL_RECORDS"
+        else
+            warn "parse failed: $FILE"
+        fi
+    done
+
+    load_call_graph "$ALL_RECORDS"
+
+    if is_reverse; then
+        build_inverse_graph
+        has_callers "$ROOT" || die "no callers found for: $ROOT"
+        render_callers "$ROOT" 0 ""
+    else
+        is_defined "$ROOT" || die "function not found: $ROOT"
+        render_tree "$ROOT" 0 ""
+    fi
+}
+
+main "$@"
