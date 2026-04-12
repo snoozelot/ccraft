@@ -1,0 +1,808 @@
+#!/usr/bin/env bash
+# cdeadl — detect potential deadlocks in C source
+#
+# WHAT IT DOES
+# If deposit() locks config then account, and withdraw() locks account then
+# config — they can deadlock. This tool finds such contradictions in C source.
+#
+# Two modes:
+#   Inference mode (default): finds contradictions in lock ordering across paths
+#   Level mode (--level): verifies each path follows declared level order
+#
+# WHY
+# Deadlock requires four conditions (Coffman 1971):
+#   - mutual exclusion
+#   - hold-and-wait
+#   - no preemption
+#   - circular wait
+#
+# Break any one and deadlock is impossible. Dijkstra (1965) showed that a
+# total order on lock acquisition breaks circular wait. The hard part is
+# keeping every code path in sync.
+#
+# TYPE-BASED TRACKING
+# Lock identity is based on the declaration type, not the variable name:
+#   - a->mu and b->mu both resolve to Account.mu if both are Account*
+#   - This matches Surelock's type-level approach in Rust
+#   - No need for --same when instances have the same type
+#
+# LEVEL DECLARATION
+# Levels are declared via CLI/config:
+#   --level 2 Account.mu    # struct field
+#   --level 1 g_config      # global variable
+#
+# Source annotations via __attribute__((annotate("lock_level=N"))) are not yet
+# supported because clang's JSON AST dump omits annotation string values.
+#
+# See: https://notes.brooklynzelenka.com/Blog/Surelock
+#
+# HOW IT WORKS
+# 1. clang -ast-dump=json — parses each source file into an AST
+# 2. jq — extract type-based lock identity from FieldDecl/VarDecl,
+#    expand interprocedurally, track held locks, generate pairs, detect cycles
+#
+# USAGE
+#   cdeadl [OPTIONS] FILE...
+#
+# OPTIONS
+#   -a FN           lock acquisition function, repeatable
+#                   default: pthread_mutex_lock mtx_lock hmutex_lock
+#   -u FN           unlock function, repeatable
+#                   default: pthread_mutex_unlock mtx_unlock hmutex_unlock
+#   -D NAME         preprocessor define
+#   -I DIR          add include directory
+#   -v              verbose output
+#   -h              show this help
+#
+#   --level N LOCK...    assign locks to level N, enables level mode
+#                        LOCK is: StructName.field (struct field) or name (global)
+#   --ignore LOCK...     skip these locks entirely
+#   --trylock FN...      nonblocking lock functions, not counted as held
+#   --slock FN...        shared/readonly lock functions, don't conflict
+#   --lockset LOCK...    locks acquired atomically together, no conflict within
+#   --config FILE        load settings from file
+#
+# EXAMPLES
+#   # Detect deadlocks (inference mode)
+#   cdeadl examples/deadlock.c
+#   → deadlock: Account.mu vs Config.mu
+#       Account.mu:54 → Config.mu:55
+#       Config.mu:92 → Account.mu:93
+#
+#     deadlock: Account.mu → Logger.mu → Config.mu → Account.mu
+#       Account.mu:72 → Logger.mu:73
+#       ...
+#
+#   # Verify lock ordering (level mode)
+#   cdeadl --level 1 Config.mu --level 2 Account.mu examples/deadlock-levels.c
+#   → level violation in withdraw(): Config.mu (level 1, line 43) acquired after Account.mu (level 2, line 42)
+#
+#   # Real usage
+#   cdeadl src/*.c
+#   cdeadl --lockset Account.mu Transaction.mu src/*.c
+#
+# EXIT CODES
+#   0   no issues found
+#   1   deadlock cycle or level violation detected
+#   2   file error or jq failure
+#
+# DEPENDENCIES
+#   clang, jq
+
+set -euo pipefail
+
+
+# ── configuration ─────────────────────────────────────────────────────────────
+
+readonly DEFAULT_ACQUIRE='["pthread_mutex_lock","mtx_lock","hmutex_lock"]'
+readonly DEFAULT_RELEASE='["pthread_mutex_unlock","mtx_unlock","hmutex_unlock"]'
+
+ACQUIRE_LIST=()
+RELEASE_LIST=()
+TRYLOCK_LIST=()
+SLOCK_LIST=()
+IGNORE_LIST=()
+LOCKSET_GROUPS=()
+LEVELS=()
+DEFINES=()
+INCLUDES=()
+VERBOSE=
+LEVEL_MODE=
+
+# ── helpers ───────────────────────────────────────────────────────────────────
+
+die()  { echo "cdeadl: $*" >&2; exit 2; }
+warn() { echo "cdeadl: $*" >&2; }
+got()  { [[ -n $1 ]]; }
+
+has_arguments()       { [[ $# -gt 0 ]]; }
+arg_count_ge()        { local N=$1; shift; [[ $# -ge $N ]]; }
+has_items()           { local -n ARR=$1; [[ ${#ARR[@]} -gt 0 ]]; }
+has_files()           { [[ ${#POSITIONAL[@]} -gt 0 ]]; }
+has_file_errors()     { [[ $FILE_ERRORS -gt 0 ]]; }
+file_exists()         { [[ -f $1 ]]; }
+is_option()           { [[ $1 == -* ]]; }
+is_source_file()      { [[ $1 == *.c || $1 == *.h ]]; }
+is_option_value()     { ! is_option "$1" && ! is_source_file "$1"; }
+more_option_values()  { has_arguments "$@" && is_option_value "$1"; }
+jq_failed()           { [[ $JQ_EXIT -ne 0 ]]; }
+
+array_to_json()  { local -n A=$1; printf '%s\n' "${A[@]}" | jq -R . | jq -s .; }
+add_words_to()   { local -n LIST=$1; local WORDS; read -ra WORDS <<< "$2"; LIST+=("${WORDS[@]}"); }
+groups_to_json() {
+    local -n G=$1
+    printf '%s\n' "${G[@]}" \
+    | while read -r LINE; do
+        echo "$LINE" | tr ',' '\n' | jq -R . | jq -s .
+    done \
+    | jq -s .
+}
+levels_to_json() {
+    local ENTRY LVL LOCKS LOCK
+
+    for ENTRY in "${LEVELS[@]}"; do
+        LVL=${ENTRY%%:*}
+        LOCKS=${ENTRY#*:}
+        echo "$LOCKS" | tr ',' '\n' | while read -r LOCK; do
+            if got "$LOCK"; then echo "{\"$LOCK\": $LVL}"; fi
+        done
+    done | jq -s 'add // {}'
+}
+
+usage() {
+    cat <<'EOF'
+Usage: cdeadl [OPTIONS] FILE...
+
+Detect potential deadlocks in C source via type-based lock tracking.
+
+Options:
+  -a FN              lock function; default: pthread_mutex_lock, mtx_lock, hmutex_lock
+  -u FN              unlock function; default: pthread_mutex_unlock, mtx_unlock, hmutex_unlock
+  -D NAME            preprocessor define
+  -I DIR             include directory
+  -v                 verbose
+  -h                 help
+
+  --level N LOCK...  assign locks to level N, enables level verification
+                     LOCK format: Account.mu (struct field) or g_lock (global)
+  --ignore LOCK...   skip these locks
+  --trylock FN...    nonblocking, not counted as held
+  --slock FN...      shared/readonly, don't conflict with each other
+  --lockset LOCK...  locks acquired atomically, no conflict within set
+  --config FILE      load settings from file
+
+Examples:
+  cdeadl src/*.c                                    # inference mode
+  cdeadl --level 1 Config.mu --level 2 Account.mu src/*.c
+  cdeadl --lockset Account.mu Transaction.mu src/*.c
+EOF
+}
+
+# ── config file ───────────────────────────────────────────────────────────────
+
+load_config() {
+    local FILE=$1
+    local LINE
+    file_exists "$FILE" || die "config not found: $FILE"
+    
+    while IFS= read -r LINE || [[ -n $LINE ]]; do
+        LINE=${LINE%%#*}
+        LINE=${LINE%"${LINE##*[![:space:]]}"}
+        LINE=${LINE#"${LINE%%[![:space:]]*}"}
+        got "$LINE" || continue
+        
+        if [[ $LINE =~ ^level[[:space:]]+([0-9]+)[[:space:]]+(.+)$ ]]; then
+            LEVEL_MODE=1
+            LEVELS+=("${BASH_REMATCH[1]}:${BASH_REMATCH[2]// /,}")
+        elif [[ $LINE =~ ^lockset[[:space:]]+(.+)$ ]]; then
+            LOCKSET_GROUPS+=("${BASH_REMATCH[1]// /,}")
+        elif [[ $LINE =~ ^ignore[[:space:]]+(.+)$ ]]; then
+            add_words_to IGNORE_LIST "${BASH_REMATCH[1]}"
+        elif [[ $LINE =~ ^trylock[[:space:]]+(.+)$ ]]; then
+            add_words_to TRYLOCK_LIST "${BASH_REMATCH[1]}"
+        elif [[ $LINE =~ ^slock[[:space:]]+(.+)$ ]]; then
+            add_words_to SLOCK_LIST "${BASH_REMATCH[1]}"
+        elif [[ $LINE =~ ^acquire[[:space:]]+(.+)$ ]]; then
+            add_words_to ACQUIRE_LIST "${BASH_REMATCH[1]}"
+        elif [[ $LINE =~ ^release[[:space:]]+(.+)$ ]]; then
+            add_words_to RELEASE_LIST "${BASH_REMATCH[1]}"
+        fi
+    done < "$FILE"
+}
+
+# ── argument parsing ──────────────────────────────────────────────────────────
+
+parse_args() {
+    local -a FILES=()
+    
+    while has_arguments "$@"; do
+        case "$1" in
+            -a) ACQUIRE_LIST+=("$2"); shift 2 ;;
+            -u) RELEASE_LIST+=("$2"); shift 2 ;;
+            -D) DEFINES+=("-D$2"); shift 2 ;;
+            -I) INCLUDES+=("-I$2"); shift 2 ;;
+            -v) VERBOSE=1; shift ;;
+            -h) usage; exit 0 ;;
+            
+            --level)
+                shift
+                arg_count_ge 2 "$@" || die "--level requires N and at least one LOCK"
+                local LEVEL=$1; shift
+                LEVEL_MODE=1
+                local LOCKS=""
+                while more_option_values "$@"; do
+                    LOCKS+="${LOCKS:+,}$1"; shift
+                done
+                LEVELS+=("$LEVEL:$LOCKS")
+                ;;
+
+            --lockset)
+                shift
+                arg_count_ge 2 "$@" || die "--lockset requires at least two LOCKs"
+                local GROUP=""
+                while more_option_values "$@"; do
+                    GROUP+="${GROUP:+,}$1"; shift
+                done
+                LOCKSET_GROUPS+=("$GROUP")
+                ;;
+
+            --ignore)
+                shift
+                while more_option_values "$@"; do
+                    IGNORE_LIST+=("$1"); shift
+                done
+                ;;
+
+            --trylock)
+                shift
+                while more_option_values "$@"; do
+                    TRYLOCK_LIST+=("$1"); shift
+                done
+                ;;
+
+            --slock)
+                shift
+                while more_option_values "$@"; do
+                    SLOCK_LIST+=("$1"); shift
+                done
+                ;;
+            
+            --config)
+                load_config "$2"; shift 2
+                ;;
+            
+            --)
+                shift; break
+                ;;
+
+            -*)
+                die "unknown option: $1"
+                ;;
+
+            *)
+                FILES+=("$1"); shift
+                ;;
+        esac
+    done
+
+    FILES+=("$@")
+    
+    POSITIONAL=("${FILES[@]+"${FILES[@]}"}")
+}
+
+# ── build JSON config ─────────────────────────────────────────────────────────
+
+# Convert list to JSON, with default fallback
+json_or_default() {
+    local NAME=$1
+    local DEFAULT=$2
+
+    if has_items "$NAME"; then
+        array_to_json "$NAME"
+    else
+        echo "$DEFAULT"
+    fi
+}
+
+# Merge trylock/slock into acquire list
+merge_lock_fns() {
+    local ACQUIRE=$1
+    local EXTRA=$2
+
+    if [[ $EXTRA != '[]' ]]; then
+        jq -n --argjson a "$ACQUIRE" --argjson e "$EXTRA" '$a + $e'
+    else
+        echo "$ACQUIRE"
+    fi
+}
+
+build_config() {
+    local ACQUIRE
+    local RELEASE
+    local TRYLOCK
+    local SLOCK
+    local IGNORE
+    local LOCKSET
+    local LEVELS_JSON
+
+    ACQUIRE=$(json_or_default ACQUIRE_LIST "$DEFAULT_ACQUIRE")
+    RELEASE=$(json_or_default RELEASE_LIST "$DEFAULT_RELEASE")
+    TRYLOCK=$(json_or_default TRYLOCK_LIST '[]')
+    SLOCK=$(json_or_default SLOCK_LIST '[]')
+    IGNORE=$(json_or_default IGNORE_LIST '[]')
+
+    # Trylock and slock are also acquire functions
+    ACQUIRE=$(merge_lock_fns "$ACQUIRE" "$TRYLOCK")
+    ACQUIRE=$(merge_lock_fns "$ACQUIRE" "$SLOCK")
+
+    if has_items LOCKSET_GROUPS; then
+        LOCKSET=$(groups_to_json LOCKSET_GROUPS)
+    else
+        LOCKSET='[]'
+    fi
+
+    if has_items LEVELS; then
+        LEVELS_JSON=$(levels_to_json)
+    else
+        LEVELS_JSON='{}'
+    fi
+
+    jq -n \
+        --argjson acquire "$ACQUIRE" \
+        --argjson release "$RELEASE" \
+        --argjson trylock "$TRYLOCK" \
+        --argjson slock "$SLOCK" \
+        --argjson ignore "$IGNORE" \
+        --argjson lockset "$LOCKSET" \
+        --argjson levels "$LEVELS_JSON" \
+        --argjson level_mode "${LEVEL_MODE:-0}" \
+        --argjson verbose "${VERBOSE:-0}" \
+        '{
+            acquire: $acquire,
+            release: $release,
+            trylock: $trylock,
+            slock: $slock,
+            ignore: $ignore,
+            lockset: $lockset,
+            levels: $levels,
+            level_mode: ($level_mode == 1),
+            verbose: ($verbose == 1)
+        }'
+}
+
+# ── jq analysis program ───────────────────────────────────────────────────────
+
+write_jq_program() {
+    cat << 'ENDJQ'
+# ── predicates ────────────────────────────────────────────────────────────────
+
+def is_acquire: . as $n | $config.acquire | any(. == $n);
+def is_release: . as $n | $config.release | any(. == $n);
+def is_trylock: . as $n | $config.trylock | any(. == $n);
+def is_slock:   . as $n | $config.slock   | any(. == $n);
+def is_ignored: . as $n | $config.ignore  | any(. == $n);
+
+def is_wrapper:      .kind? == "UnaryOperator" or .kind? == "ImplicitCastExpr" or .kind? == "ParenExpr";
+def is_array_sub:    .kind? == "ArraySubscriptExpr";
+def is_member:       .kind? == "MemberExpr";
+def is_decl_ref:     .kind? == "DeclRefExpr";
+def is_function:     .kind? == "FunctionDecl" and .name != null and .name != "";
+def is_param:        .kind? == "ParmVarDecl";
+def is_body:         .kind? == "CompoundStmt";
+def is_call:         .kind? == "CallExpr";
+def is_local:        .loc.includedFrom | not;
+def has_body:        any(.inner[]?; is_body);
+def is_lock_event:   .type == "L";
+def is_unlock_event: .type == "U";
+def is_call_event:   .type == "C";
+
+def same_lock($a; $b):        $a == $b;
+def both_readers($ta; $tb):   $ta == "R" and $tb == "R";
+
+def in_lockset($a; $b):
+    $config.lockset | any(. as $s | ($s | any(. == $a)) and ($s | any(. == $b)));
+
+def no_conflict($held_lock; $held_type; $new_lock; $new_type):
+    same_lock($held_lock; $new_lock) or
+    in_lockset($held_lock; $new_lock) or
+    both_readers($held_type; $new_type);
+
+def get_level: $config.levels[.] // null;
+
+# ── type parsing ──────────────────────────────────────────────────────────────
+
+def strip_qualifiers: gsub("^\\s*(const\\s+)?(volatile\\s+)?((struct|union|enum)\\s+)?"; "");
+def strip_pointers:   gsub("\\s*\\*+$"; "") | gsub("\\s+$"; "");
+def parse_type:       strip_qualifiers | strip_pointers;
+
+# ── AST traversal ─────────────────────────────────────────────────────────────
+
+def inner:     .inner[0];
+def field:     .name // "?";
+def base_type: inner.type.qualType // "" | parse_type;
+def ref_name:  .referencedDecl.name // null;
+
+# Type-based lock identity: Account.mu not ptr->mu
+def lock_type_key:
+    if . == null then null
+    elif is_decl_ref then ref_name
+    elif is_wrapper then inner | lock_type_key
+    elif is_array_sub then inner | lock_type_key
+    elif is_member then
+        base_type as $t | field as $f |
+        if $t != "" and $t != "?" then "\($t).\($f)" else $f end
+    else null end;
+
+# Instance path for display: ptr->mu
+def arrow_or_dot: if .isArrow then "->" else "." end;
+
+def expr_path:
+    if . == null then null
+    elif is_decl_ref then ref_name
+    elif is_wrapper then inner | expr_path
+    elif is_array_sub then (inner | expr_path) as $b | if $b then "\($b)[]" else null end
+    elif is_member then
+        (inner | expr_path) as $base |
+        if $base then "\($base)\(arrow_or_dot)\(field)" else null end
+    else null end;
+
+# ── call extraction ───────────────────────────────────────────────────────────
+
+def call_fn_name:
+    first(inner | .. | select(is_decl_ref) | ref_name) // null;
+
+def call_args:
+    [.inner[1:][]? | lock_type_key | select(. != null)];
+
+def event_type($fn):
+    if $fn | is_acquire then "L"
+    elif $fn | is_release then "U"
+    else "C" end;
+
+# ── function extraction ───────────────────────────────────────────────────────
+
+def extract_param:
+    {name: (.name // ""), type: ((.type.qualType // "") | parse_type)};
+
+def extract_event:
+    (call_fn_name // "") as $fn |
+    ($fn | is_acquire) or ($fn | is_release) as $is_lock_op |
+    {
+        offset: (.range.begin.offset // 0),
+        line: (.loc.line // .range.begin.line // 0),
+        fn: $fn,
+        type: event_type($fn),
+        type_key: (if $is_lock_op then .inner[1]? | lock_type_key else null end),
+        path: (if $is_lock_op then .inner[1]? | expr_path else null end),
+        arg_type_keys: (if $is_lock_op then null else call_args end)
+    };
+
+def extract_function:
+    {
+        name: .name,
+        params: [.inner[]? | select(is_param) | extract_param],
+        events: [.. | select(is_call) | extract_event] | sort_by(.offset)
+    };
+
+def extract_functions:
+    [.inner[]? | select(is_function) | select(has_body) | select(is_local) | extract_function]
+    | INDEX(.name);
+
+# ── parameter substitution ────────────────────────────────────────────────────
+
+def build_subst($params; $args):
+    reduce range($params | length) as $i ({};
+        $params[$i] as $p | ($args[$i] // null) as $a |
+        if $p.name != "" and $a != null then
+            .[$p.name] = {type_key: $a, struct_type: $p.type}
+        else . end
+    );
+
+def substitute($subst):
+    . as $lock |
+    if ($subst | length) == 0 then $lock
+    else
+        (first(
+            $subst | to_entries[] |
+            .key as $k | .value as $v |
+            select($lock == $k or ($lock | startswith("\($k)->")) or ($lock | startswith("\($k)."))) |
+            {key: $k, type_key: $v.type_key, struct: $v.struct_type}
+        ) // null) as $match |
+        if $match == null then $lock
+        elif $lock == $match.key then $match.type_key
+        else
+            ($lock | sub("^\($match.key)[->.]"; "")) as $f |
+            if $match.struct != "" then "\($match.struct).\($f)" else $match.type_key end
+        end
+    end;
+
+# ── lock tracking ─────────────────────────────────────────────────────────────
+
+def lock_type($fn): if $fn | is_slock then "R" else "W" end;
+
+def record_pair($held; $lock; $ltype; $line):
+    {a: $held.lock, b: $lock, ta: $held.ltype, tb: $ltype, la: $held.line, lb: $line};
+
+def add_pairs($lock; $ltype; $line):
+    reduce (.held | to_entries[]) as $e (.;
+        if no_conflict($e.key; $e.value.ltype; $lock; $ltype) then .
+        else .pairs += [record_pair({lock: $e.key, ltype: $e.value.ltype, line: $e.value.line}; $lock; $ltype; $line)]
+        end
+    );
+
+def hold_lock($lock; $ltype; $path; $line):
+    .held[$lock] = {ltype: $ltype, path: $path, line: $line} |
+    .sequence += [{lock: $lock, type: $ltype, path: $path, line: $line}];
+
+def process_lock($lock; $ltype; $path; $line):
+    add_pairs($lock; $ltype; $line) | hold_lock($lock; $ltype; $path; $line);
+
+# ── interprocedural expansion ─────────────────────────────────────────────────
+
+def resolve_lock($ev; $subst):
+    ($ev.type_key // "") | substitute($subst);
+
+def skip_lock($lock; $fn):
+    $lock == "" or ($lock | is_ignored) or ($fn | is_trylock);
+
+def expand($funcs; $fn; $params; $args; $held; $expanding):
+    if $expanding[$fn] then {pairs: [], sequence: []}
+    elif ($funcs[$fn] | not) then {pairs: [], sequence: []}
+    else
+        ($expanding | .[$fn] = true) as $exp2 |
+        build_subst($params; $args) as $subst |
+        reduce $funcs[$fn].events[] as $ev ({pairs: [], sequence: [], held: $held};
+            if $ev | is_lock_event then
+                resolve_lock($ev; $subst) as $lock |
+                if skip_lock($lock; $ev.fn) then .
+                else process_lock($lock; lock_type($ev.fn); $ev.path; $ev.line) end
+            elif $ev | is_unlock_event then
+                resolve_lock($ev; $subst) as $lock |
+                if $lock == "" then . else del(.held[$lock]) end
+            elif $ev | is_call_event then
+                if ($funcs[$ev.fn] | not) then .
+                else
+                    (($ev.arg_type_keys // []) | map(substitute($subst))) as $new_args |
+                    expand($funcs; $ev.fn; $funcs[$ev.fn].params; $new_args; .held; $exp2) as $sub |
+                    .pairs += $sub.pairs | .sequence += $sub.sequence
+                end
+            else . end
+        ) | {pairs: .pairs, sequence: .sequence}
+    end;
+
+# ── level verification ────────────────────────────────────────────────────────
+
+def level_error($fn; $item; $level):
+    "level violation in \($fn)(): \($item.lock) (level \($level), line \($item.line)) acquired after \(.prev_lock) (level \(.prev_level), line \(.prev_line))";
+
+def same_level_error($fn; $item; $level):
+    "same-level conflict in \($fn)(): \($item.lock) (line \($item.line)) and \(.prev_lock) (line \(.prev_line)) both at level \($level)";
+
+def no_level_error($item; $fn):
+    "no level declared for: \($item.lock) (in \($fn), line \($item.line))";
+
+def check_level($fn; $item):
+    ($item.lock | get_level) as $level |
+    if $level == null then .violations += [no_level_error($item; $fn)]
+    elif $level < .prev_level then .violations += [level_error($fn; $item; $level)]
+    elif $level == .prev_level and $item.lock != .prev_lock then
+        .violations += [same_level_error($fn; $item; $level)]
+    else . end |
+    .prev_lock = $item.lock |
+    .prev_level = ($level // .prev_level) |
+    .prev_line = $item.line;
+
+def verify_levels($fn; $seq):
+    reduce $seq[] as $item ({prev_lock: null, prev_level: 0, prev_line: 0, violations: []};
+        check_level($fn; $item)
+    ) | .violations;
+
+# ── graph building ────────────────────────────────────────────────────────────
+
+def edge_key($a; $b): "\($a)→\($b)";
+
+def add_edge($pair):
+    .edges[$pair.a] = ((.edges[$pair.a] // []) + [$pair.b] | unique) |
+    .has_write[edge_key($pair.a; $pair.b)] = ($pair.ta == "W" or $pair.tb == "W") |
+    .edge_lines[edge_key($pair.a; $pair.b)] = {held: $pair.la, acquired: $pair.lb};
+
+def build_graph:
+    reduce .[] as $p ({edges: {}, has_write: {}, edge_lines: {}}; add_edge($p));
+
+# ── cycle detection ───────────────────────────────────────────────────────────
+
+def has_reverse_edge($a; $b): .edges[$b] // [] | any(. == $a);
+def edge_is_write($a; $b):    .has_write[edge_key($a; $b)] // false;
+
+def either_write($a; $b):
+    edge_is_write($a; $b) or edge_is_write($b; $a);
+
+def find_2lock_conflicts:
+    . as $g |
+    [$g.edges | to_entries[] | .key as $a | .value[] | . as $b |
+        select($a < $b) |
+        select($g | has_reverse_edge($a; $b)) |
+        select($g | either_write($a; $b)) |
+        {a: $a, b: $b,
+         ab: $g.edge_lines[edge_key($a; $b)],
+         ba: $g.edge_lines[edge_key($b; $a)]}
+    ];
+
+# Rotate cycle to canonical form (smallest element first)
+def normalize_cycle:
+    min_by(.) as $min |
+    (to_entries | map(select(.value == $min)) | .[0].key) as $idx |
+    .[$idx:] + .[0:$idx];
+
+def cycle_key: join("→");
+
+def cycle_has_write($graph):
+    . as $path |
+    reduce range(length) as $i (false;
+        . or ($graph | edge_is_write($path[$i]; $path[($i+1) % ($path | length)]))
+    );
+
+def path_contains($node): any(. == $node);
+
+def extend_path($graph; $path; $seen):
+    ($path | last) as $cur |
+    reduce ($graph.edges[$cur] // [])[] as $next ({stack: [], found: [], seen: $seen};
+        if $next == $path[0] and ($path | length) >= 3 then
+            ($path | normalize_cycle) as $norm |
+            ($norm | cycle_key) as $key |
+            if .seen[$key] then .
+            elif $path | cycle_has_write($graph) then
+                .found += [$norm] | .seen[$key] = true
+            else . end
+        elif ($path | path_contains($next)) then .
+        elif ($path | length) >= 10 then .
+        else .stack += [$path + [$next]]
+        end
+    );
+
+def find_all_cycles:
+    . as $graph |
+    ($graph.edges | keys) as $nodes |
+    reduce $nodes[] as $start ({cycles: [], seen: {}};
+        {stack: [[$start]], result: .cycles, seen: .seen} |
+        until(.stack | length == 0;
+            .stack[-1] as $path | .stack = .stack[:-1] |
+            extend_path($graph; $path; .seen) as $ext |
+            .stack += $ext.stack | .result += $ext.found | .seen = $ext.seen
+        ) | {cycles: .result, seen: .seen}
+    ) | [.cycles[] | select(length >= 3)];
+
+# ── output formatting ─────────────────────────────────────────────────────────
+
+def format_2lock($c):
+    "deadlock: \($c.a) vs \($c.b)",
+    "  \($c.a):\($c.ab.held) → \($c.b):\($c.ab.acquired)",
+    "  \($c.b):\($c.ba.held) → \($c.a):\($c.ba.acquired)";
+
+def format_cycle($c; $graph):
+    "deadlock: \($c | join(" → ")) → \($c[0])",
+    (reduce range($c | length) as $i ([];
+        ($c[$i]) as $a | ($c[($i+1) % ($c | length)]) as $b |
+        . + ["  \($a):\($graph.edge_lines[edge_key($a; $b)].held) → \($b):\($graph.edge_lines[edge_key($a; $b)].acquired)"]
+    ) | .[]);
+
+def format_verbose($pairs):
+    "lock orderings found:", ($pairs[] | "  \(.a):\(.la) → \(.b):\(.lb)");
+
+def format_results($pairs; $c2; $cn; $graph):
+    (if $config.verbose then format_verbose($pairs) else empty end),
+    (if ($c2 | length) > 0 then
+        (if $config.verbose then "" else empty end),
+        ($c2 | to_entries[] | (if .key > 0 then "" else empty end), format_2lock(.value))
+     else empty end),
+    (if ($cn | length) > 0 then
+        (if ($c2 | length) > 0 then "" else empty end),
+        ($cn | to_entries[] | (if .key > 0 then "" else empty end), format_cycle(.value; $graph))
+     else empty end);
+
+# ── main ──────────────────────────────────────────────────────────────────────
+
+def analyze_function($funcs; $fn):
+    expand($funcs; $fn; []; []; {}; {}) as $result |
+    {
+        pairs: $result.pairs,
+        violations: (if $config.level_mode then verify_levels($fn; $result.sequence) else [] end)
+    };
+
+def collect_results($funcs):
+    reduce ($funcs | keys[]) as $fn ({all_pairs: [], violations: []};
+        analyze_function($funcs; $fn) as $r |
+        .all_pairs += $r.pairs | .violations += $r.violations
+    );
+
+def output_level_mode:
+    if (.violations | length) > 0 then .violations | unique | join("\n")
+    else empty end;
+
+def output_inference_mode:
+    (.all_pairs | unique) as $pairs |
+    ($pairs | build_graph) as $graph |
+    ($graph | find_2lock_conflicts) as $c2 |
+    ($graph | find_all_cycles) as $cn |
+    format_results($pairs; $c2; $cn; $graph);
+
+extract_functions as $funcs |
+collect_results($funcs) |
+if $config.level_mode then output_level_mode else output_inference_mode end
+ENDJQ
+}
+
+# ── AST collection ────────────────────────────────────────────────────────────
+
+# Run clang to get JSON AST, uses DEFINES/INCLUDES
+clang_ast() {
+    clang -x c -fsyntax-only -Xclang -ast-dump=json \
+        ${DEFINES[@]+"${DEFINES[@]}"} \
+        ${INCLUDES[@]+"${INCLUDES[@]}"} \
+        "$1" 2>/dev/null
+}
+
+# Merge temp AST into combined AST_FILE
+merge_ast() {
+    local TMP=$1
+
+    jq --slurpfile add "$TMP" '.inner += ($add[0].inner // [])' "$AST_FILE" > "${AST_FILE}.new"
+    mv "${AST_FILE}.new" "$AST_FILE"
+    rm -f "$TMP"
+}
+
+# ── main ──────────────────────────────────────────────────────────────────────
+
+main() {
+    parse_args "$@"
+
+    has_files || { usage >&2; exit 1; }
+
+    local CONFIG
+    local AST_FILE
+    local JQ_FILE
+
+    CONFIG=$(build_config)
+    AST_FILE=$(mktemp)
+    JQ_FILE=$(mktemp)
+    trap "rm -f '$AST_FILE' '$JQ_FILE'" EXIT
+
+    echo '{"inner":[]}' > "$AST_FILE"
+    write_jq_program > "$JQ_FILE"
+
+    local FILE_ERRORS=0
+
+    for FILE in "${POSITIONAL[@]}"; do
+        file_exists "$FILE" || { warn "not found: $FILE"; FILE_ERRORS=$((FILE_ERRORS + 1)); continue; }
+
+        local TMP_AST
+        TMP_AST=$(mktemp)
+
+        if ! clang_ast "$FILE" > "$TMP_AST"; then
+            warn "parse failed: $FILE"
+            rm -f "$TMP_AST"
+            FILE_ERRORS=$((FILE_ERRORS + 1))
+            continue
+        fi
+
+        merge_ast "$TMP_AST"
+    done
+
+    local OUTPUT
+    local JQ_EXIT
+    
+    OUTPUT=$(jq -r --argjson config "$CONFIG" -f "$JQ_FILE" "$AST_FILE") && JQ_EXIT=0 || JQ_EXIT=$?
+    
+    if jq_failed; then die "analysis failed (jq exit $JQ_EXIT)"; fi
+    
+    if got "$OUTPUT"; then
+        echo "$OUTPUT"
+        exit 1
+    fi
+
+    if has_file_errors; then exit 2; fi
+    exit 0
+}
+
+POSITIONAL=()
+main "$@"
