@@ -1,0 +1,258 @@
+#!/usr/bin/awk -f
+# cdecl — explain C declarations in English
+#
+# WHAT IT DOES
+#   Translates C declaration syntax into plain English. Handles pointers,
+#   arrays, function pointers, and arbitrarily nested declarators. Reads
+#   from a single argument or stdin, one declaration per line.
+#
+# WHY
+#   C declaration syntax is inside-out: the name sits in the middle and
+#   types wrap around it in parsing order, not reading order. cdecl unwinds
+#   the grammar and renders it left-to-right in English.
+#
+# HOW IT WORKS
+#   Tokenizes the declaration, then applies recursive-descent parsing:
+#   parse_specifiers reads the base type; parse_declarator handles prefix
+#   operators (pointers, cv-qualifiers, grouped sub-declarators);
+#   parse_postfix handles suffix operators (arrays, function parameters).
+#   parse_params recurses to handle function pointer parameters.
+#
+# USAGE
+#   cdecl DECLARATION
+#   cdecl help
+#   echo DECLARATION | cdecl
+#
+# EXAMPLES
+#   cdecl 'int *p'
+#   → p is pointer to int
+#
+#   cdecl 'int (*fp)(int, char)'
+#   → fp is pointer to function (int, char) returning int
+#
+#   cdecl 'int (*arr)[10]'
+#   → arr is pointer to array 10 of int
+#
+#   cdecl 'void (*signal(int, void (*)(int)))(int)'
+#   → signal is function (int, pointer to function (int) returning void)
+#     returning pointer to function (int) returning void
+#
+#   # Process multiple declarations
+#   cdecl < examples/declarations.txt
+
+# ============================================================================
+# Token predicates
+# ============================================================================
+
+function is_type_specifier(t) {
+    return t ~ /^(void|char|short|int|long|float|double|signed|unsigned|const|volatile|struct|union|enum)$/
+}
+
+function is_tagged_type(t) { return t == "struct" || t == "union" || t == "enum" }
+function is_qualifier(t)   { return t ~ /^(const|volatile)$/ }
+function is_identifier(t)  { return t ~ /^[a-zA-Z_][a-zA-Z0-9_]*$/ }
+function is_pointer(t)     { return t == "*" }
+function is_empty(n)       { return n == 0 }
+
+function is_help_request(s) {
+    return s == "-h" || s == "--help" || s == "help"
+}
+
+function is_function_paren() {
+    return tokens[pos + 1] != "*"
+}
+
+# ============================================================================
+# Tokenizer
+# ============================================================================
+
+function tokenize(s,    n) {
+    gsub(/[[:space:]]+/, " ", s)
+    gsub(/\(/, " ( ", s)
+    gsub(/\)/, " ) ", s)
+    gsub(/\[/, " [ ", s)
+    gsub(/\]/, " ] ", s)
+    gsub(/\*/, " * ", s)
+    gsub(/,/,  " , ", s)
+    gsub(/[[:space:]]+/, " ", s)
+    gsub(/^[[:space:]]+|[[:space:]]+$/, "", s)
+
+    n = split(s, tokens, " ")
+    return n
+}
+
+# ============================================================================
+# Parser
+# ============================================================================
+
+function parse_specifiers(    spec, t) {
+    spec = ""
+    while (pos <= ntokens) {
+        t = tokens[pos]
+        if (!is_type_specifier(t)) { break }
+        if (is_tagged_type(t)) {
+            spec = spec t " " tokens[pos + 1] " "
+            pos += 2
+        } else {
+            spec = spec t " "
+            pos++
+        }
+    }
+    gsub(/[[:space:]]+$/, "", spec)
+    return spec
+}
+
+function parse_declarator(    result, ptrs, quals, t) {
+    ptrs = ""
+
+    while (pos <= ntokens && is_pointer(tokens[pos])) {
+        pos++
+        quals = ""
+        while (is_qualifier(tokens[pos])) {
+            quals = quals tokens[pos] " "
+            pos++
+        }
+        ptrs = quals "pointer to " ptrs
+    }
+
+    t = tokens[pos]
+
+    if (t == "(") {
+        pos++
+        result = parse_declarator()
+        pos++
+    } else if (is_identifier(t)) {
+        result = t " is "
+        pos++
+    } else {
+        result = ""
+    }
+
+    result = result parse_postfix()
+    result = result ptrs
+
+    return result
+}
+
+function parse_array_suffix(    result) {
+    pos++
+    if (tokens[pos] == "]") {
+        result = "array of "
+        pos++
+    } else {
+        result = "array " tokens[pos] " of "
+        pos += 2
+    }
+    return result
+}
+
+function parse_postfix(    result, t, params) {
+    result = ""
+
+    while (pos <= ntokens) {
+        t = tokens[pos]
+
+        if (t == "[") {
+            result = result parse_array_suffix()
+        } else if (t == "(" && is_function_paren()) {
+            pos++
+            params = parse_params()
+            result = result "function (" params ") returning "
+            pos++
+        } else {
+            break
+        }
+    }
+
+    return result
+}
+
+function strip_name(s) {
+    sub(/ is $/, "", s)
+    sub(/^[a-zA-Z_][a-zA-Z0-9_]* is /, "", s)
+    return s
+}
+
+function parse_params(    result, pbase, pdecl) {
+    result = ""
+
+    while (pos <= ntokens && tokens[pos] != ")") {
+        if (tokens[pos] == ",") {
+            pos++
+            result = result ", "
+            continue
+        }
+
+        pbase = parse_specifiers()
+        pdecl = parse_declarator()
+
+        if (pdecl != "") {
+            result = result strip_name(pdecl) pbase
+        } else {
+            result = result pbase
+        }
+    }
+
+    if (is_empty(length(result))) { result = "void" }
+    return result
+}
+
+# ============================================================================
+# Output
+# ============================================================================
+
+function print_usage() {
+    print "Usage: cdecl DECLARATION"
+    print "       cdecl help"
+    print "       cdecl < file"
+    print ""
+    print "Explain C declarations in English."
+    print ""
+    print "Examples:"
+    print "  cdecl 'int *p'         → p is pointer to int"
+    print "  cdecl 'int (*fp)(int)' → fp is pointer to function (int) returning int"
+}
+
+function is_comment(line) { return line ~ /^[[:space:]]*#/ }
+function is_blank(line)   { return line ~ /^[[:space:]]*$/ }
+
+function process(line,    base, result) {
+    if (is_blank(line) || is_comment(line)) { print ""; return }
+
+    ntokens = tokenize(line)
+    if (is_empty(ntokens)) { print ""; return }
+
+    pos    = 1
+    base   = parse_specifiers()
+    result = parse_declarator()
+
+    if (result == "") {
+        print "error: abstract declarator"
+        return
+    }
+    print result base
+}
+
+# ============================================================================
+# Main
+# ============================================================================
+
+BEGIN {
+    if (ARGC > 1) {
+        if (is_help_request(ARGV[1])) {
+            print_usage()
+            exit 0
+        }
+        input = ""
+        start = 1
+        if (ARGV[1] == "--") { start = 2 }
+        for (i = start; i < ARGC; i++) {
+            input = input " " ARGV[i]
+            delete ARGV[i]
+        }
+        process(input)
+        exit
+    }
+}
+
+{ process($0) }

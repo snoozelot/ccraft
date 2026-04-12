@@ -1,0 +1,35 @@
+# declarations.txt — example for cdecl
+#
+# C declarations to explain. Run each line through cdecl:
+#   cdecl 'int *p'
+#   cdecl < examples/declarations.txt
+#
+# Basic types
+int x
+char c
+unsigned long n
+
+# Pointers
+int *p
+char **argv
+const char *s
+char *const p
+const char *const p
+
+# Arrays
+int arr[10]
+char buf[256]
+int matrix[3][4]
+char *names[10]
+
+# Function pointers
+int (*fp)(void)
+int (*fp)(int, char)
+void (*handler)(int)
+int (*compare)(const void *, const void *)
+
+# Complex declarations
+int (*arr)[10]
+int *(*fp)(int)
+void (*signal(int, void (*)(int)))(int)
+char *(*(*fp)(int))[10]
