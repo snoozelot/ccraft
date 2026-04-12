@@ -1,0 +1,292 @@
+#!/usr/bin/env bash
+# cxref — C cross-reference: where every symbol is defined and used
+#
+# WHAT IT DOES
+#   For each C source file, lists every symbol with its definition and
+#   reference sites. Symbols include functions, variables, parameters,
+#   typedefs, structs, enums, struct fields, and enum constants.
+#
+# WHY
+#   Text-search cross-reference tools produce false positives: a search for
+#   "count" matches "recount", and struct field "x" is confused with a local
+#   variable "x". This tool uses clang's AST, which resolves each reference
+#   to its precise declaration.
+#
+# HOW IT WORKS
+#   1. clang -ast-dump=json — parses each source file into an AST.
+#   2. jq — walks the AST tree, propagating line numbers from parent nodes
+#      to children. clang 22 omits the line field from expression nodes
+#      (DeclRefExpr, CallExpr) when it matches the parent; propagation
+#      recovers the correct value. Emits one TSV record per occurrence:
+#      name, kind, file, line, role.
+#   3. bash — sorts, deduplicates, and formats records as TSV or JSON.
+#
+# OUTPUT COLUMNS
+#   symbol  kind  file  line  role
+#
+#   kind: function | variable | parameter | typedef | struct | enum
+#         field | enumerator
+#   role: definition | declaration | reference
+#
+#   "definition"  — body or storage: function with body, variable with
+#                   storage, struct/enum with body.
+#   "declaration" — forward declaration (function prototype, extern var).
+#   "reference"   — a use site.
+#
+# USAGE
+#   cxref [OPTIONS] FILE...
+#
+# OPTIONS
+#   --json        JSON array instead of TSV
+#   -D NAME       Preprocessor define
+#   -I DIR        Include directory
+#   -h, --help    Help
+#
+# EXAMPLES
+#   cxref foo.c
+#   cxref --json foo.c bar.c
+#
+#   # All occurrences of "count"
+#   cxref foo.c | awk -F'\t' '$1 == "count"'
+#
+#   # All function definitions
+#   cxref foo.c | awk -F'\t' '$2 == "function" && $5 == "definition"'
+#
+#   # All reference sites, sorted by line
+#   cxref foo.c | awk -F'\t' '$5 == "reference"' | sort -t$'\t' -k4,4n
+#
+#   # JSON query
+#   cxref --json foo.c | jq '.[] | select(.symbol == "count")'
+#
+#   # Which symbols are referenced but never defined (extern/missing)?
+#   cxref foo.c | awk -F'\t' '
+#     $5 == "definition" { defined[$1] = 1 }
+#     $5 == "reference"  { refs[$1] = 1 }
+#     END { for (s in refs) if (!defined[s]) print s }
+#   '
+#
+# LIMITATIONS
+#   Macro names are not tracked; they are expanded before AST construction.
+#   Struct field access via -> and . is not recorded as a reference.
+#   If the same static symbol name appears in multiple files, records are
+#   emitted per file independently.
+#
+# DEPENDENCIES
+#   clang, jq
+
+set -euo pipefail
+
+# ── configuration ─────────────────────────────────────────────────────────────
+
+FORMAT=tsv
+DEFINES=()
+INCLUDES=()
+CLEANUP_FILES=()
+
+# ── infrastructure ────────────────────────────────────────────────────────────
+
+die()  { echo "cxref: $*" >&2; exit 1; }
+warn() { echo "cxref: $*" >&2; }
+
+cleanup() {
+    local F
+
+    for F in "${CLEANUP_FILES[@]+"${CLEANUP_FILES[@]}"}"; do rm -f "$F"; done
+}
+trap cleanup EXIT
+
+create_tempfile() {
+    local T
+
+    T=$(mktemp)
+    CLEANUP_FILES+=("$T")
+    echo "$T"
+}
+
+# ── predicates ────────────────────────────────────────────────────────────────
+
+got()           { [[ -n $1 ]]; }
+no()            { [[ -z $1 ]]; }
+has_arguments() { [[ $# -gt 0 ]]; }
+file_exists()   { [[ -f "$1" ]]; }
+is_json()       { [[ $FORMAT == json ]]; }
+
+# ── AST ───────────────────────────────────────────────────────────────────────
+
+# Replace shebang with spaces so clang accepts ccraft-style source files.
+# Spaces preserve byte offsets so AST locations remain accurate.
+strip_shebang() { sed '1 { /^#!/ s|.| |g }' "$1"; }
+
+ast_json() {
+    strip_shebang "$1" \
+    | clang -x c -fsyntax-only -Xclang -ast-dump=json \
+        ${DEFINES[@]+"${DEFINES[@]}"} \
+        ${INCLUDES[@]+"${INCLUDES[@]}"} \
+        - 2>/dev/null
+}
+
+# ── extraction ────────────────────────────────────────────────────────────────
+
+# Emit TSV records: symbol TAB kind TAB file TAB line TAB role
+#
+# Walk the AST tree recursively, threading the current line number through
+# so that expression nodes (which lack explicit line info in clang 22's JSON
+# when unchanged from the parent) get the correct location.
+#
+# $file  — source file path (the argument given to clang)
+# $ln    — current line inherited from the nearest ancestor with a line number
+#
+# Definition nodes emit from .loc.line (the name location), not range.begin.
+# DeclRefExpr nodes emit from the propagated line.
+readonly JQ_XREF='
+def kind_label:
+  { "FunctionDecl":     "function",
+    "VarDecl":          "variable",
+    "ParmVarDecl":      "parameter",
+    "TypedefDecl":      "typedef",
+    "RecordDecl":       "struct",
+    "EnumDecl":         "enum",
+    "FieldDecl":        "field",
+    "EnumConstantDecl": "enumerator" } as $m |
+  $m[.] // (. | ascii_downcase);
+
+def is_def_kind:
+  . == "FunctionDecl"    or . == "VarDecl"         or . == "ParmVarDecl"      or
+  . == "TypedefDecl"     or . == "RecordDecl"       or . == "FieldDecl"        or
+  . == "EnumDecl"        or . == "EnumConstantDecl";
+
+# FunctionDecl with a body → definition; without → declaration.
+# Everything else → definition.
+def decl_role:
+  if .kind == "FunctionDecl" then
+    if any(.inner[]?; .kind == "CompoundStmt") then "definition"
+    else "declaration"
+    end
+  else "definition"
+  end;
+
+# Walk the tree, threading the current line.
+# range.begin.line advances the line counter; loc.line is used for the
+# declaration record (it points to the name, not the return type).
+def walk($ln):
+  (.range.begin.line? // $ln) as $l |
+  (.loc.line? // $l) as $decl_l |
+  (if (.kind | is_def_kind) and (.name? != null) and (.name != "") then
+    [.name, (.kind | kind_label), $file, ($decl_l | tostring), decl_role] | @tsv
+  elif .kind == "DeclRefExpr" and
+       (.referencedDecl?.name? != null) and (.referencedDecl.name != "") then
+    [.referencedDecl.name,
+     (.referencedDecl.kind | kind_label),
+     $file, ($l | tostring), "reference"] | @tsv
+  else empty
+  end),
+  (.inner[]? | walk($l));
+
+# Entry point: top-level source-file declarations only.
+# Included-file nodes are skipped; their children are never walked.
+.inner[]? |
+select(.loc.includedFrom | not) |
+select(.loc.line? != null) |
+walk(.loc.line)
+'
+
+xref_in() {
+    local FILE=$1
+
+    ast_json "$FILE" | jq -r --arg file "$FILE" "$JQ_XREF"
+}
+
+# ── output ────────────────────────────────────────────────────────────────────
+
+# Sort: symbol asc, role asc (declaration < definition < reference), file, line.
+sort_records() { sort -t$'\t' -k1,1 -k5,5 -k3,3 -k4,4n -u; }
+
+emit_tsv() {
+    printf 'symbol\tkind\tfile\tline\trole\n'
+    sort_records < "$1"
+}
+
+emit_json() {
+    sort_records < "$1" \
+    | jq -Rn '[inputs | split("\t") | {
+        symbol: .[0],
+        kind:   .[1],
+        file:   .[2],
+        line:   (.[3] | tonumber),
+        role:   .[4]
+    }]'
+}
+
+# ── usage ─────────────────────────────────────────────────────────────────────
+
+usage() {
+    cat <<'EOF'
+Usage: cxref [OPTIONS] FILE...
+
+Show where every C symbol is defined and referenced.
+
+Options:
+  --json        JSON array instead of TSV
+  -D NAME       Preprocessor define
+  -I DIR        Include directory
+  -h, --help    Help
+
+Output columns: symbol, kind, file, line, role
+  kind: function | variable | parameter | typedef | struct | enum
+        field | enumerator
+  role: definition | declaration | reference
+
+Examples:
+  cxref foo.c
+  cxref --json foo.c bar.c
+  cxref foo.c | awk -F'\t' '$1 == "count"'
+  cxref foo.c | awk -F'\t' '$2 == "function" && $5 == "definition"'
+  cxref --json foo.c | jq '.[] | select(.symbol == "count")'
+
+Notes:
+  Macro names are not tracked (expanded before AST).
+  Struct field access (-> .) is not tracked as references.
+EOF
+}
+
+# ── main ──────────────────────────────────────────────────────────────────────
+
+main() {
+    local FILE
+    local ALL_RECORDS
+    local OUTPUT
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --json)    FORMAT=json ;;
+            -D)        shift; DEFINES+=("-D$1") ;;
+            -D*)       DEFINES+=("$1") ;;
+            -I)        shift; INCLUDES+=("-I$1") ;;
+            -I*)       INCLUDES+=("$1") ;;
+            -h|--help) usage; exit 0 ;;
+            --)        shift; break ;;
+            -*)        die "unknown option: $1" ;;
+            *)         break ;;
+        esac
+        shift
+    done
+
+    has_arguments "$@" || { usage >&2; exit 1; }
+
+    ALL_RECORDS=$(create_tempfile)
+
+    for FILE in "$@"; do
+        file_exists "$FILE"         || { warn "not found: $FILE";    continue; }
+        OUTPUT=$(xref_in "$FILE")   || { warn "parse failed: $FILE"; continue; }
+        got "$OUTPUT"               || continue
+        printf '%s\n' "$OUTPUT" >> "$ALL_RECORDS"
+    done
+
+    if is_json; then
+        emit_json "$ALL_RECORDS"
+    else
+        emit_tsv "$ALL_RECORDS"
+    fi
+}
+
+main "$@"
