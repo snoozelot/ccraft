@@ -18,7 +18,7 @@ C development tools.
 
 ## ccraft
 
-Run C files as scripts. No Makefile, no autoconf, no CMake. Write, execute.
+Run C files as scripts. No Makefile, no autoconf, no CMake, just add shebang and execute.
 Compiles on first run, caches the binary, recompiles when source changes.
 
 ```c

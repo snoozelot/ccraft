@@ -6,6 +6,9 @@
 #   arrays, function pointers, and arbitrarily nested declarators. Reads
 #   from a single argument or stdin, one declaration per line.
 #
+#   Lines that cannot be parsed (comments, blanks, errors) output blank lines
+#   to preserve line correspondence with input.
+#
 # WHY
 #   C declaration syntax is inside-out: the name sits in the middle and
 #   types wrap around it in parsing order, not reading order. cdecl unwinds
@@ -21,7 +24,7 @@
 # USAGE
 #   cdecl DECLARATION
 #   cdecl -h | --help
-#   echo DECLARATION | cdecl
+#   cdecl < file
 #
 # EXAMPLES
 #   cdecl 'int *p'
@@ -37,8 +40,7 @@
 #   → signal is function (int, pointer to function (int) returning void)
 #     returning pointer to function (int) returning void
 #
-#   # Process multiple declarations
-#   cdecl < examples/declarations.txt
+#   cdecl < examples/cdecl.txt
 
 set -euo pipefail
 
@@ -56,12 +58,12 @@ Examples:
 EOF
 }
 
-has_arguments() { [[ $# -gt 0 ]]; }
-is_help()       { [[ $1 == -h || $1 == --help || $1 == help ]]; }
+has_args()      { [[ $# -gt 0 ]]; }
+is_help()       { [[ $1 == -h || $1 == --help ]]; }
 stdin_is_tty()  { [[ -t 0 ]]; }
 
-readonly AWK_PROGRAM='
-# ── token predicates ──────────────────────────────────────────────────────────
+readonly AWK='
+# ── predicates ────────────────────────────────────────────────────────────────
 
 function is_type_specifier(t) {
     return t ~ /^(void|char|short|int|long|float|double|signed|unsigned|const|volatile|struct|union|enum)$/
@@ -72,8 +74,7 @@ function is_qualifier(t)   { return t ~ /^(const|volatile)$/ }
 function is_identifier(t)  { return t ~ /^[a-zA-Z_][a-zA-Z0-9_]*$/ }
 function is_pointer(t)     { return t == "*" }
 function is_empty(n)       { return n == 0 }
-function is_comment(line)  { return line ~ /^[[:space:]]*#/ }
-function is_blank(line)    { return line ~ /^[[:space:]]*$/ }
+function is_skip(line)     { return line ~ /^[[:space:]]*(#|$)/ }
 function starts_params()   { return tokens[pos + 1] != "*" }
 
 # ── tokenizer ─────────────────────────────────────────────────────────────────
@@ -209,19 +210,16 @@ function parse_params(    result, pbase, pdecl) {
 # ── main ──────────────────────────────────────────────────────────────────────
 
 function process(line,    base, result) {
-    if (is_blank(line) || is_comment(line)) { return }
+    if (is_skip(line)) { print ""; return }
 
     ntokens = tokenize(line)
-    if (is_empty(ntokens)) { return }
+    if (is_empty(ntokens)) { print ""; return }
 
-    pos    = 1
-    base   = parse_specifiers()
+    pos = 1
+    base = parse_specifiers()
     result = parse_declarator()
 
-    if (result == "") {
-        print "error: abstract declarator"
-        return
-    }
+    if (result == "") { print ""; return }
     print result base
 }
 
@@ -229,14 +227,14 @@ function process(line,    base, result) {
 '
 
 main() {
-    if has_arguments "$@"; then
+    if has_args "$@"; then
         if is_help "$1"; then usage; exit 0; fi
-        echo "$*" | awk "$AWK_PROGRAM"
+        echo "$*" | awk "$AWK"
     elif stdin_is_tty; then
         usage >&2
         exit 1
     else
-        awk "$AWK_PROGRAM"
+        awk "$AWK"
     fi
 }
 
