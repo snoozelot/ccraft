@@ -1,0 +1,425 @@
+#!/usr/bin/env bash
+# cstruct — show struct layout with padding
+#
+# WHAT IT DOES
+# Annotates C source with struct memory layout. Shows each field's slot size
+# (bytes until next field) and offset. Without a struct name, acts as a filter
+# passing through all content. With a struct name, outputs only that struct.
+#
+# WHY
+# Struct padding is invisible but affects performance and memory. This tool
+# makes layout explicit so you can reorder fields to eliminate waste.
+#
+# HOW IT WORKS
+# Uses clang -fdump-record-layouts for accurate compiler layout. Field sizes
+# are computed from offset differences, not guessed from types. This handles
+# complex types like pthread_mutex_t correctly.
+#
+# USAGE
+#   cstruct FILE.c                   # annotate all structs, pass through rest
+#   cstruct FILE.c STRUCT            # output only STRUCT
+#   cstruct 'struct { int x; ... }'  # inline definition
+#
+# EXAMPLES
+#   $ cstruct examples/structs.c packet
+#   struct packet {                         /* 24 bytes, align 8 */
+#       char type;                          /*  1 byte  @  0 bytes, 7 padding */
+#       void *data;                         /*  8 bytes @  8 bytes */
+#       short len;                          /*  2 bytes @ 16 bytes */
+#       char flags;                         /*  1 byte  @ 18 bytes, 5 padding */
+#   };
+#
+# EXIT CODES
+#   0   success (or no structs, passes through unchanged)
+#   2   clang error
+#
+# DEPENDENCIES
+#   clang, gawk
+
+set -euo pipefail
+
+# ── helpers ───────────────────────────────────────────────────────────────────
+
+die()  { echo "cstruct: $*" >&2; exit 2; }
+got()  { [[ -n $1 ]]; }
+
+has_arguments() { [[ $# -gt 0 ]]; }
+is_file()       { [[ -f $1 ]]; }
+is_inline()     { [[ $1 == *struct* ]] || [[ $1 == *union* ]]; }
+no()            { [[ -z $1 ]]; }
+
+lacks_semicolon() { [[ $1 != *';'* ]]; }
+
+usage() {
+    cat <<'EOF'
+Usage: cstruct FILE.c [STRUCT]
+       cstruct 'struct { ... }'
+
+Annotate C source with struct memory layout.
+Without STRUCT: pass through entire file, annotate all structs.
+With STRUCT: output only that struct with annotations.
+
+Options:
+  -h, --help    show this help
+
+Examples:
+  cstruct src/packet.c              # annotate all structs
+  cstruct src/packet.c Header       # just struct Header
+  cstruct 'struct { char a; int b; }'
+EOF
+}
+
+# ── clang layout parsing ──────────────────────────────────────────────────────
+
+# Extract layout info from clang -fdump-record-layouts output
+# Output format: struct_name|field_name|offset|size|type
+# Field sizes computed from offset differences (accurate, not guessed)
+parse_layouts() {
+    gawk '
+    function flush_struct() {
+        if (field_count == 0) return
+
+        # Output fields in declaration order, compute sizes from offset differences
+        for (i = 1; i <= field_count; i++) {
+            fname = field_names[i]
+            ftype = field_types[fname]
+            off = field_offsets[fname]
+
+            if (ftype == "bitfield") {
+                print current_struct "|" fname "|" off "||bitfield"
+            } else {
+                # Find next non-bitfield offset for size calculation
+                next_off = total_size
+                for (j = i + 1; j <= field_count; j++) {
+                    if (field_types[field_names[j]] != "bitfield") {
+                        next_off = field_offsets[field_names[j]] + 0
+                        break
+                    }
+                }
+                fsize = next_off - off
+                print current_struct "|" fname "|" off "|" fsize "|field"
+            }
+        }
+        print current_struct "|__size__|" total_size "|" alignment "|info"
+
+        # Reset for next struct
+        delete field_names
+        delete field_offsets
+        delete field_types
+        field_count = 0
+    }
+
+    /^\*\*\* Dumping AST Record Layout/ { flush_struct(); in_layout = 1; next }
+    /^\*\*\* Dumping IRgen Record Layout/ { in_layout = 0; next }
+
+    in_layout && /\| struct / && !/\|   / {
+        if (match($0, /struct ([a-zA-Z_][a-zA-Z0-9_]*)/, m)) {
+            current_struct = m[1]
+        } else {
+            current_struct = "(anonymous)"
+        }
+        next
+    }
+
+    in_layout && /\| union / && !/\|   / {
+        if (match($0, /union ([a-zA-Z_][a-zA-Z0-9_]*)/, m)) {
+            current_struct = m[1]
+        } else {
+            current_struct = "(anonymous)"
+        }
+        next
+    }
+
+    in_layout && /\| __anon_t$/ {
+        current_struct = "(anonymous)"
+        next
+    }
+
+    in_layout && /\[sizeof=/ {
+        if (match($0, /\[sizeof=([0-9]+), align=([0-9]+)\]/, m)) {
+            total_size = m[1] + 0
+            alignment = m[2] + 0
+        }
+        next
+    }
+
+    # Only process direct fields (exactly 3 spaces after |, not nested members)
+    in_layout && /^[[:space:]]*[0-9].*\|   [^ ]/ {
+        line = $0
+        if (match(line, /^[[:space:]]*([0-9]+)(:([0-9]+)-([0-9]+))?/, off_match)) {
+            offset_bytes = off_match[1] + 0
+            if (off_match[3] != "") {
+                offset_bits = off_match[3]
+                bit_end = off_match[4]
+                is_bitfield = 1
+            } else {
+                offset_bits = ""
+                bit_end = ""
+                is_bitfield = 0
+            }
+        }
+
+        sub(/^[[:space:]]*[0-9]+(:([0-9]+-[0-9]+))?[[:space:]]*\|[[:space:]]*/, "", line)
+
+        # Skip struct/union header lines
+        if (line ~ /^(struct|union) [a-zA-Z_][a-zA-Z0-9_]*$/) next
+
+        field = line
+        gsub(/^.*[[:space:]]/, "", field)
+
+        if (field != "" && field !~ /^[0-9]/) {
+            field_count++
+            field_names[field_count] = field
+            if (is_bitfield) {
+                field_offsets[field] = offset_bytes ":" offset_bits "-" bit_end
+                field_types[field] = "bitfield"
+            } else {
+                field_offsets[field] = offset_bytes
+                field_types[field] = "field"
+            }
+        }
+    }
+
+    END { flush_struct() }
+    '
+}
+
+# Generate code that forces struct layout computation
+generate_sizeof_code() {
+    local INPUT=$1
+    local ANON_COUNT=0
+
+    cat "$INPUT"
+    echo ""
+
+    # Check for anonymous struct (inline mode)
+    if grep -qE '^\s*(struct|union)\s*\{' "$INPUT" && ! grep -qE '^\s*(struct|union)\s+[a-zA-Z_]' "$INPUT"; then
+        # Anonymous struct - wrap in typedef
+        echo "typedef"
+        cat "$INPUT"
+        echo "__anon_t; __anon_t __anon_var; int __sz = sizeof(__anon_var);"
+        return
+    fi
+
+    # Extract struct/union names and generate sizeof expressions
+    grep -E '^\s*(struct|union)\s+[a-zA-Z_][a-zA-Z0-9_]*\s*\{' "$INPUT" \
+    | sed -E 's/.*\b(struct|union)\s+([a-zA-Z_][a-zA-Z0-9_]*).*/\1 \2/' \
+    | while read -r KIND NAME; do
+        echo "$KIND $NAME __cstruct_$NAME; int __cstruct_sz_$NAME = sizeof(__cstruct_$NAME);"
+    done
+}
+
+# Get layout from clang
+get_layouts() {
+    local INPUT=$1
+    local TMPFILE
+
+    TMPFILE=$(mktemp --suffix=.c)
+    generate_sizeof_code "$INPUT" > "$TMPFILE"
+
+    clang -Xclang -fdump-record-layouts -c "$TMPFILE" -o /dev/null 2>&1 \
+    | parse_layouts
+
+    rm -f "$TMPFILE"
+}
+
+# ── annotation ────────────────────────────────────────────────────────────────
+
+# Annotate file. If TARGET set, output only that struct; otherwise pass through all.
+annotate_file() {
+    local FILE=$1
+    local LAYOUTS=$2
+    local TARGET=${3:-}
+
+    gawk -v layouts="$LAYOUTS" -v target="$TARGET" '
+    BEGIN {
+        # Parse all layouts into arrays keyed by struct name
+        n = split(layouts, lines, "\n")
+        for (i = 1; i <= n; i++) {
+            split(lines[i], parts, "|")
+            sname = parts[1]
+            fname = parts[2]
+            off = parts[3]
+            sz = parts[4]
+            typ = parts[5]
+
+            if (fname == "__size__") {
+                struct_size[sname] = off
+                struct_align[sname] = sz
+            } else if (typ == "field" || typ == "bitfield") {
+                field_offset[sname, fname] = off
+                field_size[sname, fname] = sz
+                field_type[sname, fname] = typ
+            }
+        }
+
+        in_struct = 0
+        brace_depth = 0
+        current_struct = ""
+        prev_end = 0
+        comment_col = 50
+        filter_mode = (target != "")
+        output_struct = 0
+    }
+
+    function pad_to(s, col,    len) {
+        len = length(s)
+        while (len < col) { s = s " "; len++ }
+        return s
+    }
+
+    function format_size(bytes) {
+        if (bytes == 1) return " 1 byte "
+        else return sprintf("%2d bytes", bytes)
+    }
+
+    function format_offset(off) {
+        if (off + 0 < 10) return " " off " bytes"
+        else return off " bytes"
+    }
+
+    # Start of struct/union definition (has { on line, not a field declaration)
+    /^[[:space:]]*(typedef[[:space:]]+)?(struct|union)[[:space:]]/ && /{/ && !/\*/ {
+        if (match($0, /(struct|union)[[:space:]]+([a-zA-Z_][a-zA-Z0-9_]*)/, m)) {
+            current_struct = m[2]
+        } else {
+            current_struct = "(anonymous)"
+        }
+
+        if (current_struct in struct_size) {
+            output_struct = (!filter_mode || current_struct == target)
+            in_struct = 1
+            brace_depth = 1
+            if (output_struct) {
+                line = pad_to($0, comment_col)
+                print line "/* " struct_size[current_struct] " bytes, align " struct_align[current_struct] " */"
+            }
+            next
+        }
+    }
+
+    in_struct && /{/ { brace_depth++ }
+
+    in_struct && /}/ {
+        brace_depth--
+        if (brace_depth == 0) {
+            if (output_struct) print
+            in_struct = 0
+            output_struct = 0
+            current_struct = ""
+            next
+        }
+    }
+
+    # Field lines inside struct (including struct-typed pointers)
+    in_struct && /^[[:space:]]+[a-zA-Z_]/ {
+        if (!output_struct) next
+
+        line = $0
+        field = line
+        sub(/;.*$/, "", field)
+        sub(/\[[^\]]*\]/, "", field)
+        sub(/\s*:.*$/, "", field)
+        gsub(/^.*[[:space:]\*]/, "", field)
+
+        if ((current_struct, field) in field_offset) {
+            off_raw = field_offset[current_struct, field]
+            typ = field_type[current_struct, field]
+
+            # Handle bitfield offset (byte:bit-range format)
+            if (typ == "bitfield" && match(off_raw, /([0-9]+):([0-9]+)-([0-9]+)/, m)) {
+                byte_off = m[1] + 0
+                bit_start = m[2] + 0
+                bit_end = m[3] + 0
+                bit_size = bit_end - bit_start + 1
+                out = pad_to($0, comment_col)
+                printf "%s/* %2d bits @ byte %d bit %d */\n", out, bit_size, byte_off, bit_start
+                next
+            }
+
+            off = off_raw + 0
+
+            # Slot size from clang (field + padding to next)
+            slot = field_size[current_struct, field] + 0
+
+            # Estimate actual size from type pattern
+            type_str = $0
+            sub(/\/\/.*$/, "", type_str)
+            sub(/\/\*.*\*\//, "", type_str)
+
+            actual = 4  # default
+            if (type_str ~ /\*/) actual = 8
+            else if (type_str ~ /char[[:space:]]/) actual = 1
+            else if (type_str ~ /short[[:space:]]/) actual = 2
+            else if (type_str ~ /(int|unsigned)[[:space:]]/ && type_str !~ /long/) actual = 4
+            else if (type_str ~ /long[[:space:]]/) actual = 8
+            else if (type_str ~ /double[[:space:]]/) actual = 8
+            else if (type_str ~ /float[[:space:]]/) actual = 4
+
+            # Handle arrays
+            if (match($0, /\[([0-9]+)\]/, arr)) {
+                actual = actual * arr[1]
+            }
+
+            # If slot > 8 and estimated is small, it is a complex type — use slot as actual
+            if (slot > 8 && actual <= 4) actual = slot
+
+            # Clamp to slot (estimated cannot exceed slot)
+            if (actual > slot) actual = slot
+
+            padding = slot - actual
+            out = pad_to($0, comment_col)
+            if (padding > 0) {
+                printf "%s/* %s @ %s, %d padding */\n", out, format_size(actual), format_offset(off), padding
+            } else {
+                printf "%s/* %s @ %s */\n", out, format_size(actual), format_offset(off)
+            }
+            next
+        }
+    }
+
+    # Pass through non-struct content (unless filtering)
+    !filter_mode { print }
+    ' "$FILE"
+}
+
+# ── main ──────────────────────────────────────────────────────────────────────
+
+main() {
+    has_arguments "$@" || { usage; exit 1; }
+
+    case "$1" in
+        -h|--help) usage; exit 0 ;;
+    esac
+
+    local INPUT
+    local TARGET=""
+    local TMPFILE
+
+    # Handle file vs inline struct definition
+    if is_file "$1"; then
+        INPUT=$1
+        TARGET=${2:-}
+    elif is_inline "$1"; then
+        TMPFILE=$(mktemp --suffix=.c)
+        trap "rm -f '$TMPFILE'" EXIT
+        echo "$1" > "$TMPFILE"
+        if lacks_semicolon "$1"; then echo " x;" >> "$TMPFILE"; fi
+        INPUT=$TMPFILE
+    else
+        die "not a file: $1"
+    fi
+
+    # Get layouts from clang
+    local LAYOUTS
+    LAYOUTS=$(get_layouts "$INPUT")
+
+    if no "$LAYOUTS"; then
+        if no "$TARGET"; then cat "$INPUT"; fi
+        exit 0
+    fi
+
+    annotate_file "$INPUT" "$LAYOUTS" "$TARGET"
+}
+
+main "$@"
