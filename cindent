@@ -1,0 +1,189 @@
+#!/usr/bin/env bash
+# cindent — format C code to 1TBS style
+#
+# WHAT IT DOES
+# Formats C source files using clang-format configured for:
+# - 1TBS braces (same line, always present even for single statements)
+# - 4-space indent, no tabs
+# - Return type on own line for definitions
+# - Pointer asterisk right-aligned (char *p not char* p)
+#
+# USAGE
+#   cindent [OPTIONS] FILE...
+#   cat file.c | cindent
+#
+# OPTIONS
+#   -i           edit files in place
+#   -g, --gnu    use GNU indent instead of clang-format
+#   -h, --help   show this help
+#
+# EXAMPLES
+#   cindent examples/unformatted.c       # to stdout
+#   cindent -i examples/unformatted.c    # in place
+#   cindent -g examples/unformatted.c    # GNU indent backend
+#
+# DEPENDENCIES
+#   clang-format (default), or GNU indent (-g)
+
+set -euo pipefail
+
+# ----------------------------------------------------------------------------
+# Helpers
+# ----------------------------------------------------------------------------
+
+usage() {
+    cat <<'EOF'
+Usage: cindent [OPTIONS] FILE...
+       cat file.c | cindent
+
+Format C code to 1TBS style.
+
+Options:
+  -i           edit files in place
+  -g, --gnu    use GNU indent instead of clang-format
+  -h, --help   show this help
+EOF
+}
+
+# ----------------------------------------------------------------------------
+# Formatters
+# ----------------------------------------------------------------------------
+
+gnu_indent() {
+    indent \
+        --indent-level 4 \
+        --continuation-indentation 4 \
+        --case-indentation 0 \
+        --parameter-indentation 6 \
+        --declaration-indentation 6 \
+        --no-tabs \
+        --tab-size 8 \
+        --line-length 80 \
+        --swallow-optional-blank-lines \
+        --no-space-after-function-call-names \
+        --no-space-after-casts \
+        --blank-lines-after-procedures \
+        --braces-on-struct-decl-line \
+        --braces-on-if-line \
+        --braces-on-func-def-line \
+        --space-after-if \
+        --cuddle-else \
+        --cuddle-do-while \
+        --procnames-start-lines \
+        --break-function-decl-args \
+        --break-function-decl-args-end \
+        --continue-at-parentheses \
+        --dont-format-first-column-comments \
+        "$@"
+}
+
+clang_format() {
+    local STYLE
+    read -r -d '' STYLE <<'EOF' || :
+{
+    BasedOnStyle: LLVM,
+    Language: Cpp,
+    IndentWidth: 4,
+    TabWidth: 8,
+    UseTab: Never,
+    ContinuationIndentWidth: 4,
+    ColumnLimit: 80,
+    BreakBeforeBraces: Custom,
+    BraceWrapping: {
+        AfterCaseLabel: false,
+        AfterClass: false,
+        AfterControlStatement: Never,
+        AfterEnum: false,
+        AfterFunction: false,
+        AfterNamespace: false,
+        AfterStruct: false,
+        AfterUnion: false,
+        AfterExternBlock: false,
+        BeforeCatch: false,
+        BeforeElse: false,
+        BeforeWhile: false,
+        IndentBraces: false,
+        SplitEmptyFunction: false,
+        SplitEmptyRecord: false,
+        SplitEmptyNamespace: false
+    },
+    InsertBraces: true,
+    SpaceAfterCStyleCast: false,
+    SpaceAfterLogicalNot: false,
+    SpaceBeforeAssignmentOperators: true,
+    SpaceBeforeParens: ControlStatements,
+    SpaceBeforeSquareBrackets: false,
+    SpaceInEmptyParentheses: false,
+    SpacesBeforeTrailingComments: 1,
+    SpacesInCStyleCastParentheses: false,
+    SpacesInConditionalStatement: false,
+    SpacesInParentheses: false,
+    SpacesInSquareBrackets: false,
+    IndentCaseLabels: false,
+    IndentCaseBlocks: false,
+    AlignAfterOpenBracket: Align,
+    BinPackParameters: false,
+    AllowAllParametersOfDeclarationOnNextLine: false,
+    PointerAlignment: Right,
+    DerivePointerAlignment: false,
+    KeepEmptyLinesAtTheStartOfBlocks: false,
+    MaxEmptyLinesToKeep: 1,
+    ReflowComments: false,
+    PenaltyBreakBeforeFirstCallParameter: 19,
+    PenaltyBreakComment: 300,
+    PenaltyBreakFirstLessLess: 120,
+    PenaltyBreakString: 1000,
+    PenaltyExcessCharacter: 1000000,
+    PenaltyReturnTypeOnItsOwnLine: 60,
+    AllowShortBlocksOnASingleLine: Never,
+    AllowShortCaseLabelsOnASingleLine: false,
+    AllowShortFunctionsOnASingleLine: None,
+    AllowShortIfStatementsOnASingleLine: Never,
+    AllowShortLoopsOnASingleLine: false,
+    AlwaysBreakAfterReturnType: AllDefinitions,
+    BreakBeforeBinaryOperators: None,
+    IndentWrappedFunctionNames: false,
+    SortIncludes: Never
+}
+EOF
+
+    clang-format --style="$STYLE" "$@"
+}
+
+# ----------------------------------------------------------------------------
+# Main
+# ----------------------------------------------------------------------------
+
+FORMATTER=clang_format
+INPLACE=
+
+format_inplace() {
+    local FILE=$1
+    local TMP
+    TMP=$(mktemp)
+    trap "rm -f '$TMP'" RETURN
+    "$FORMATTER" "$FILE" > "$TMP" && mv "$TMP" "$FILE"
+}
+
+main() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -i)        INPLACE=1; shift ;;
+            -g|--gnu)  FORMATTER=gnu_indent; shift ;;
+            -h|--help) usage; exit 0 ;;
+            --)        shift; break ;;
+            -*)        echo "cindent: unknown option: $1" >&2; exit 1 ;;
+            *)         break ;;
+        esac
+    done
+
+    if [[ -n $INPLACE ]]; then
+        for FILE in "$@"; do
+            format_inplace "$FILE"
+        done
+    else
+        "$FORMATTER" "$@"
+    fi
+}
+
+main "$@"
