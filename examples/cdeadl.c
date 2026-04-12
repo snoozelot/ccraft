@@ -1,4 +1,4 @@
-// deadlock.c — example for cdeadl
+// cdeadl.c — example for cdeadl
 //
 // Deadlock patterns: 2-lock conflicts, 3-lock chain, and deep nesting.
 //
@@ -6,7 +6,7 @@
 // of access path depth (3 pointer dereferences here). Different variables of
 // the same struct type share lock identity.
 //
-// Run: cdeadl examples/deadlock.c
+// Run: cdeadl examples/cdeadl.c
 // Expected output:
 //   deadlock: Account.mu vs Config.mu
 //   deadlock: Account.mu vs Wallet.mu

@@ -8,10 +8,13 @@ C development tools.
 - [ccompile](#ccompile) — batch compile, quiet on success
 - [clint](#clint) — lint C scripts
 - [cproto](#cproto) — extract function prototypes
-- [cdeadl](#cdeadl) — detect deadlocks
 - [cdecl](#cdecl) — explain C declarations
 - [cflow](#cflow) — function call tree
 - [cindent](#cindent) — format to 1TBS style
+- [draft/cinclude](#draftcinclude) — include dependency tree
+- [draft/cdeadl](#draftcdeadl) — detect deadlocks
+- [draft/cstruct](#draftcstruct) — show struct layout with padding
+- [draft/cxref](#draftcxref) — cross-reference symbols
 
 ## ccraft
 
@@ -87,12 +90,66 @@ Extract function prototypes from C source using clang AST.
 $ cproto src/parser.c
 ```
 
-## cdeadl
+## cdecl
+
+Explain C declarations in plain English.
+
+```sh
+$ cdecl 'int (*fp)(int, char)'
+fp is pointer to function (int, char) returning int
+
+$ cat examples/cdecl.txt | cdecl
+```
+
+## cflow
+
+Show function call tree. Forward from a root, or reverse to find callers.
+
+```sh
+$ cflow examples/cflow.c
+main() <examples/cflow.c:56>
+    factorial() <examples/cflow.c:47>
+        factorial() [recursive]
+    printf()
+    process() <examples/cflow.c:38>
+        ...
+
+$ cflow -R validate examples/cflow.c
+validate() <examples/cflow.c:26>
+    process() <examples/cflow.c:38>
+        main() <examples/cflow.c:56>
+```
+
+## cindent
+
+Format C code to 1TBS style (4-space indent, braces on same line).
+
+```sh
+$ cindent examples/cindent.c           # to stdout
+$ cindent -i src/*.c                   # in place
+```
+
+## draft/cinclude
+
+Show include dependency tree.
+
+```sh
+$ draft/cinclude -s -d 2 examples/cflow.c
+examples/cflow.c
+<stdio.h>                               → /usr/include/stdio.h
+    <bits/libc-header-start.h>          → /usr/include/bits/libc-header-start.h
+    <bits/types.h>                      → /usr/include/bits/types.h
+    ...
+<stdlib.h>                              → /usr/include/stdlib.h
+    ...
+```
+
+## draft/cdeadl
 
 Detect potential deadlocks by analyzing lock acquisition order across functions.
 
 ```sh
-$ cdeadl examples/deadlock.c
+$ draft/cdeadl examples/cdeadl.c
 deadlock: Account.mu vs Config.mu
   Account.mu:54 → Config.mu:55
   Config.mu:92 → Account.mu:93
@@ -102,48 +159,35 @@ deadlock: Account.mu → Logger.mu → Config.mu → Account.mu
   ...
 ```
 
-## cdecl
+## draft/cstruct
 
-Explain C declarations in plain English.
+Annotate C source with struct memory layout. Shows field sizes, offsets, and padding waste.
 
 ```sh
-$ cdecl 'int (*fp)(int, char)'
-fp is pointer to function (int, char) returning int
-
-$ cat examples/declarations.txt | cdecl
+$ draft/cstruct examples/cstruct.c packet
+struct packet {                         /* 24 bytes, align 8 */
+    char type;                          /*  1 byte  @  0 bytes, 7 padding */
+    void *data;                         /*  8 bytes @  8 bytes */
+    short len;                          /*  2 bytes @ 16 bytes */
+    char flags;                         /*  1 byte  @ 18 bytes, 5 padding */
+};
 ```
 
-## cflow
+## draft/cxref
 
-Show function call tree. Forward from a root, or reverse to find callers.
-
-```sh
-$ cflow examples/calltree.c
-main() <examples/calltree.c:56>
-    factorial() <examples/calltree.c:47>
-        factorial() [recursive]
-    printf()
-    process() <examples/calltree.c:38>
-        ...
-
-$ cflow -R validate examples/calltree.c
-validate() <examples/calltree.c:26>
-    process() <examples/calltree.c:38>
-        main() <examples/calltree.c:56>
-```
-
-## cindent
-
-Format C code to 1TBS style (4-space indent, braces on same line).
+Cross-reference symbols: where every function, variable, type is defined and used.
 
 ```sh
-$ cindent examples/unformatted.c       # to stdout
-$ cindent -i src/*.c                   # in place
+$ draft/cxref examples/cflow.c
+validate   function   examples/cflow.c   20   declaration
+validate   function   examples/cflow.c   26   definition
+validate   function   examples/cflow.c   40   reference
+...
 ```
 
 ## Dependencies
 
 - C compiler (`cc` or `$CC`)
-- POSIX shell, `sed`, `md5sum`
+- POSIX shell, `sed`, `md5sum`, `gawk`
 - Analysis tools: `clang`, `jq`
 - Formatting: `clang-format` or `indent`

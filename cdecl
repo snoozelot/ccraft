@@ -1,4 +1,4 @@
-#!/usr/bin/awk -f
+#!/usr/bin/env bash
 # cdecl — explain C declarations in English
 #
 # WHAT IT DOES
@@ -20,7 +20,7 @@
 #
 # USAGE
 #   cdecl DECLARATION
-#   cdecl help
+#   cdecl -h | --help
 #   echo DECLARATION | cdecl
 #
 # EXAMPLES
@@ -40,9 +40,28 @@
 #   # Process multiple declarations
 #   cdecl < examples/declarations.txt
 
-# ============================================================================
-# Token predicates
-# ============================================================================
+set -euo pipefail
+
+usage() {
+    cat <<'EOF'
+Usage: cdecl DECLARATION
+       cdecl -h | --help
+       cdecl < file
+
+Explain C declarations in English.
+
+Examples:
+  cdecl 'int *p'         → p is pointer to int
+  cdecl 'int (*fp)(int)' → fp is pointer to function (int) returning int
+EOF
+}
+
+has_arguments() { [[ $# -gt 0 ]]; }
+is_help()       { [[ $1 == -h || $1 == --help || $1 == help ]]; }
+stdin_is_tty()  { [[ -t 0 ]]; }
+
+readonly AWK_PROGRAM='
+# ── token predicates ──────────────────────────────────────────────────────────
 
 function is_type_specifier(t) {
     return t ~ /^(void|char|short|int|long|float|double|signed|unsigned|const|volatile|struct|union|enum)$/
@@ -53,18 +72,11 @@ function is_qualifier(t)   { return t ~ /^(const|volatile)$/ }
 function is_identifier(t)  { return t ~ /^[a-zA-Z_][a-zA-Z0-9_]*$/ }
 function is_pointer(t)     { return t == "*" }
 function is_empty(n)       { return n == 0 }
+function is_comment(line)  { return line ~ /^[[:space:]]*#/ }
+function is_blank(line)    { return line ~ /^[[:space:]]*$/ }
+function starts_params()   { return tokens[pos + 1] != "*" }
 
-function is_help_request(s) {
-    return s == "-h" || s == "--help" || s == "help"
-}
-
-function is_function_paren() {
-    return tokens[pos + 1] != "*"
-}
-
-# ============================================================================
-# Tokenizer
-# ============================================================================
+# ── tokenizer ─────────────────────────────────────────────────────────────────
 
 function tokenize(s,    n) {
     gsub(/[[:space:]]+/, " ", s)
@@ -81,9 +93,7 @@ function tokenize(s,    n) {
     return n
 }
 
-# ============================================================================
-# Parser
-# ============================================================================
+# ── parser ────────────────────────────────────────────────────────────────────
 
 function parse_specifiers(    spec, t) {
     spec = ""
@@ -154,7 +164,7 @@ function parse_postfix(    result, t, params) {
 
         if (t == "[") {
             result = result parse_array_suffix()
-        } else if (t == "(" && is_function_paren()) {
+        } else if (t == "(" && starts_params()) {
             pos++
             params = parse_params()
             result = result "function (" params ") returning "
@@ -167,8 +177,7 @@ function parse_postfix(    result, t, params) {
     return result
 }
 
-function strip_name(s) {
-    sub(/ is $/, "", s)
+function strip_param_name(s) {
     sub(/^[a-zA-Z_][a-zA-Z0-9_]* is /, "", s)
     return s
 }
@@ -187,40 +196,23 @@ function parse_params(    result, pbase, pdecl) {
         pdecl = parse_declarator()
 
         if (pdecl != "") {
-            result = result strip_name(pdecl) pbase
+            result = result strip_param_name(pdecl) pbase
         } else {
             result = result pbase
         }
     }
 
-    if (is_empty(length(result))) { result = "void" }
+    if (result == "") { result = "void" }
     return result
 }
 
-# ============================================================================
-# Output
-# ============================================================================
-
-function print_usage() {
-    print "Usage: cdecl DECLARATION"
-    print "       cdecl help"
-    print "       cdecl < file"
-    print ""
-    print "Explain C declarations in English."
-    print ""
-    print "Examples:"
-    print "  cdecl 'int *p'         → p is pointer to int"
-    print "  cdecl 'int (*fp)(int)' → fp is pointer to function (int) returning int"
-}
-
-function is_comment(line) { return line ~ /^[[:space:]]*#/ }
-function is_blank(line)   { return line ~ /^[[:space:]]*$/ }
+# ── main ──────────────────────────────────────────────────────────────────────
 
 function process(line,    base, result) {
-    if (is_blank(line) || is_comment(line)) { print ""; return }
+    if (is_blank(line) || is_comment(line)) { return }
 
     ntokens = tokenize(line)
-    if (is_empty(ntokens)) { print ""; return }
+    if (is_empty(ntokens)) { return }
 
     pos    = 1
     base   = parse_specifiers()
@@ -233,26 +225,19 @@ function process(line,    base, result) {
     print result base
 }
 
-# ============================================================================
-# Main
-# ============================================================================
+{ process($0) }
+'
 
-BEGIN {
-    if (ARGC > 1) {
-        if (is_help_request(ARGV[1])) {
-            print_usage()
-            exit 0
-        }
-        input = ""
-        start = 1
-        if (ARGV[1] == "--") { start = 2 }
-        for (i = start; i < ARGC; i++) {
-            input = input " " ARGV[i]
-            delete ARGV[i]
-        }
-        process(input)
-        exit
-    }
+main() {
+    if has_arguments "$@"; then
+        if is_help "$1"; then usage; exit 0; fi
+        echo "$*" | awk "$AWK_PROGRAM"
+    elif stdin_is_tty; then
+        usage >&2
+        exit 1
+    else
+        awk "$AWK_PROGRAM"
+    fi
 }
 
-{ process($0) }
+main "$@"

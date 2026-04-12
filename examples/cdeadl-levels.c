@@ -1,10 +1,10 @@
-// deadlock-levels.c — example for cdeadl level mode
+// cdeadl-levels.c — example for cdeadl level mode
 //
-// Same code as deadlock.c, but demonstrates level-based verification.
+// Same code as cdeadl.c, but demonstrates level-based verification.
 // Assign levels: Config.mu=1 (acquired first), Account.mu=2 (acquired second).
 // withdraw() violates this order.
 //
-// Run: cdeadl --level 1 Config.mu --level 2 Account.mu examples/deadlock-levels.c
+// Run: cdeadl --level 1 Config.mu --level 2 Account.mu examples/cdeadl-levels.c
 // Expected: level violation in withdraw(): Config.mu (level 1, line 43) acquired after Account.mu (level 2, line 42)
 
 #include <pthread.h>

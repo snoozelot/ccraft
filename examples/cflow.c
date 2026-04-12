@@ -1,18 +1,18 @@
-// calltree.c — example for cflow
+// cflow.c — example for cflow
 //
 // A small program with a clear call hierarchy and one recursive function.
 //
 // Forward tree from main:
-//   cflow examples/calltree.c
+//   cflow examples/cflow.c
 //
 // Forward tree from process:
-//   cflow -r process examples/calltree.c
+//   cflow -r process examples/cflow.c
 //
 // Reverse tree (who calls validate):
-//   cflow -R validate examples/calltree.c
+//   cflow -R validate examples/cflow.c
 //
 // Limited depth:
-//   cflow -d 2 examples/calltree.c
+//   cflow -d 2 examples/cflow.c
 
 #include <stdio.h>
 #include <stdlib.h>

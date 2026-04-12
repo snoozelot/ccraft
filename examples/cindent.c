@@ -1,9 +1,9 @@
-// unformatted.c — example for cindent
+// cindent.c — example for cindent
 //
 // Deliberately messy formatting to demonstrate cindent.
 //
-// Run: cindent examples/unformatted.c
-// Run: cindent -g examples/unformatted.c   # GNU indent backend
+// Run: cindent examples/cindent.c
+// Run: cindent -g examples/cindent.c   # GNU indent backend
 
 #include <stdio.h>
 #include <stdlib.h>
