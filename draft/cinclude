@@ -1,0 +1,394 @@
+#!/usr/bin/env bash
+# cinclude — show the include dependency tree of C source
+#
+# WHAT IT DOES
+# Prints the include dependency tree of C source in two directions:
+#
+#   Forward (default): starting from a file, shows what it includes,
+#   transitively. Each header appears fully once; subsequent occurrences
+#   are marked [...] to avoid repetition.
+#
+#   Reverse (-R): starting from a header, shows what files include it,
+#   transitively. Useful for answering "who depends on this header?"
+#
+# System headers (<stdio.h>) are hidden by default. Use -s to show them.
+# Local headers ("foo.h") are resolved relative to each file's directory,
+# then relative to -I directories.
+#
+# HOW IT WORKS
+# 1. grep — extract #include lines from source
+# 2. resolve — for "local.h", search file's directory then -I paths;
+#    for <system.h>, search -I paths only
+# 3. recurse — build tree, tracking visited files to avoid cycles
+#
+# USAGE
+#   cinclude [OPTIONS] FILE...
+#
+# OPTIONS
+#   -R HDR    reverse tree: show what includes HDR
+#   -s        show system headers (default: local only)
+#   -d N      max depth (default: unlimited)
+#   -I DIR    add include search directory
+#   -h        show this help
+#
+# EXAMPLES
+#   # What does main.c include?
+#   cinclude src/main.c
+#   → src/main.c
+#         "config.h" → src/config.h
+#             "types.h" → src/types.h
+#         "parser.h" → src/parser.h
+#             "types.h" [...]
+#
+#   # Who includes types.h?
+#   cinclude -R types.h src/*.c src/*.h
+#   → types.h
+#         config.h
+#             main.c
+#         parser.h
+#             main.c [...]
+#
+#   # Include system headers
+#   cinclude -s src/main.c
+#   → src/main.c
+#         <stdio.h> → /usr/include/stdio.h
+#             ...
+#
+# EXIT CODES
+#   0   success
+#   1   file not found
+
+set -euo pipefail
+
+# ── configuration ─────────────────────────────────────────────────────────────
+
+readonly NO_DEPTH_LIMIT=99
+
+REVERSE=
+REVERSE_TARGET=
+SHOW_SYSTEM=
+MAX_DEPTH=$NO_DEPTH_LIMIT
+INCLUDE_DIRS=()
+
+declare -A VISITED        # path → 1 (already printed fully)
+declare -A FILE_INCLUDES  # path → newline-separated includes (for reverse mode)
+
+# ── infrastructure ────────────────────────────────────────────────────────────
+
+die()  { echo "cinclude: $*" >&2; exit 1; }
+warn() { echo "cinclude: $*" >&2; }
+
+# ── predicates ────────────────────────────────────────────────────────────────
+
+got()              { [[ -n $1 ]]; }
+has_arguments()    { [[ $# -gt 0 ]]; }
+file_exists()      { [[ -f "$1" ]]; }
+is_visited()       { [[ -v VISITED[$1] ]]; }
+has_includers()    { [[ -v FILE_INCLUDES[$1] ]]; }
+is_root_depth()    { [[ $1 -eq 0 ]]; }
+within_depth()     { [[ $1 -lt $MAX_DEPTH ]]; }
+is_reverse()       { [[ -n "$REVERSE" ]]; }
+is_system_header() { [[ $1 == \<*\> ]]; }
+show_system()      { [[ -n "$SHOW_SYSTEM" ]]; }
+is_numeric()       { [[ $1 =~ ^[0-9]+$ ]]; }
+
+# ── usage ─────────────────────────────────────────────────────────────────────
+
+usage() {
+    read -r -d '' MSG <<'EOF' || :
+Usage: cinclude [OPTIONS] FILE...
+
+Show the include dependency tree of C source.
+
+Options:
+  -R HDR    reverse tree: show what includes HDR
+  -s        show system headers (default: local only)
+  -d N      max depth (default: unlimited)
+  -I DIR    include search directory
+  -h        help
+
+Examples:
+  cinclude src/main.c
+  cinclude -s src/main.c
+  cinclude -R types.h src/*.c src/*.h
+  cinclude -d 3 src/*.c
+EOF
+    echo "$MSG"
+}
+
+# ── include extraction ────────────────────────────────────────────────────────
+
+# Extract #include directives from FILE. Outputs one per line:
+#   "header.h"   or   <header.h>
+extract_includes() {
+    local FILE=$1
+
+    grep -oE '#include[[:space:]]+["<][^">]+[">]' "$FILE" 2>/dev/null \
+    | sed 's/#include[[:space:]]*//' \
+    || :
+}
+
+# ── path resolution ───────────────────────────────────────────────────────────
+
+readonly SYSTEM_INCLUDE_DIRS="/usr/include /usr/local/include"
+
+# Search for HEADER in DIRS. Returns resolved path or fails.
+find_in_dirs() {
+    local HEADER=$1
+    shift
+    local DIR
+    local CANDIDATE
+
+    for DIR in "$@"; do
+        CANDIDATE="${DIR}/${HEADER}"
+        if file_exists "$CANDIDATE"; then
+            realpath "$CANDIDATE"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# Find "header.h" relative to FILE_DIR, then INCLUDE_DIRS.
+resolve_local() {
+    local HEADER=$1
+    local FILE_DIR=$2
+
+    HEADER=${HEADER#\"}
+    HEADER=${HEADER%\"}
+
+    find_in_dirs "$HEADER" "$FILE_DIR" ${INCLUDE_DIRS[@]+"${INCLUDE_DIRS[@]}"}
+}
+
+# Find <header> in INCLUDE_DIRS, then system paths.
+resolve_system() {
+    local HEADER=$1
+
+    HEADER=${HEADER#\<}
+    HEADER=${HEADER%\>}
+
+    find_in_dirs "$HEADER" ${INCLUDE_DIRS[@]+"${INCLUDE_DIRS[@]}"} $SYSTEM_INCLUDE_DIRS
+}
+
+# Resolve INCLUDE relative to FILE. Returns path or empty.
+resolve_include() {
+    local INCLUDE=$1
+    local FILE=$2
+    local FILE_DIR
+    local RESOLVED
+
+    FILE_DIR=$(dirname "$FILE")
+
+    if is_system_header "$INCLUDE"; then
+        RESOLVED=$(resolve_system "$INCLUDE") || RESOLVED=""
+    else
+        RESOLVED=$(resolve_local "$INCLUDE" "$FILE_DIR") || RESOLVED=""
+    fi
+
+    echo "$RESOLVED"
+}
+
+# ── tree rendering ────────────────────────────────────────────────────────────
+
+indent_for() {
+    local DEPTH=$1
+    printf '%*s' $((DEPTH * 4)) ''
+}
+
+# Print include line with resolution info.
+# Column width for alignment (include name + indent).
+readonly INCLUDE_COL=40
+
+print_include() {
+    local INCLUDE=$1
+    local RESOLVED=$2
+    local INDENT=$3
+    local MARKER=$4
+    local LEFT
+    local PAD
+
+    LEFT="${INDENT}${INCLUDE}"
+    PAD=$((INCLUDE_COL - ${#LEFT}))
+    if [[ $PAD -lt 1 ]]; then PAD=1; fi
+
+    if got "$RESOLVED"; then
+        printf '%s%*s→ %s%s\n' "$LEFT" "$PAD" "" "$RESOLVED" "${MARKER:+ $MARKER}"
+    else
+        printf '%s%s\n' "$LEFT" "${MARKER:+ $MARKER}"
+    fi
+}
+
+# Forward tree: print FILE and what it includes, transitively.
+render_tree() {
+    local FILE=$1
+    local DEPTH=$2
+    local INDENT
+    local INCLUDES
+    local INCLUDE
+    local RESOLVED
+
+    INDENT=$(indent_for "$DEPTH")
+
+    if is_root_depth "$DEPTH"; then echo "$FILE"; fi
+
+    within_depth "$DEPTH" || return 0
+    file_exists "$FILE" || return 0
+
+    INCLUDES=$(extract_includes "$FILE")
+    got "$INCLUDES" || return 0
+
+    while IFS= read -r INCLUDE; do
+        got "$INCLUDE" || continue
+
+        is_system_header "$INCLUDE" && ! show_system && continue
+
+        RESOLVED=$(resolve_include "$INCLUDE" "$FILE")
+
+        # Check for cycles
+        if got "$RESOLVED" && is_visited "$RESOLVED"; then
+            print_include "$INCLUDE" "$RESOLVED" "$INDENT" "[...]"
+            continue
+        fi
+
+        print_include "$INCLUDE" "$RESOLVED" "$INDENT" ""
+
+        # Recurse if resolved
+        if got "$RESOLVED"; then
+            VISITED[$RESOLVED]=1
+            render_tree "$RESOLVED" $((DEPTH + 1))
+        fi
+    done <<< "$INCLUDES"
+}
+
+# ── reverse mode ──────────────────────────────────────────────────────────────
+
+# Record that INCLUDER includes TARGET.
+add_includer() {
+    local TARGET=$1
+    local INCLUDER=$2
+
+    if has_includers "$TARGET"; then
+        FILE_INCLUDES[$TARGET]+=$'\n'"$INCLUDER"
+    else
+        FILE_INCLUDES[$TARGET]=$INCLUDER
+    fi
+}
+
+# Scan all files, record who includes what.
+build_include_map() {
+    local FILE
+    local FILE_ABS
+    local INCLUDES
+    local INCLUDE
+    local RESOLVED
+
+    for FILE in "$@"; do
+        file_exists "$FILE" || continue
+        FILE_ABS=$(realpath "$FILE")
+
+        INCLUDES=$(extract_includes "$FILE")
+        got "$INCLUDES" || continue
+
+        while IFS= read -r INCLUDE; do
+            got "$INCLUDE" || continue
+
+            RESOLVED=$(resolve_include "$INCLUDE" "$FILE")
+            got "$RESOLVED" || continue
+
+            add_includer "$RESOLVED" "$FILE_ABS"
+        done <<< "$INCLUDES"
+    done
+}
+
+# Find target header by name or path.
+find_target() {
+    local TARGET=$1
+    shift
+    local FILE
+
+    # Exact path
+    if file_exists "$TARGET"; then
+        realpath "$TARGET"
+        return 0
+    fi
+
+    # Search in provided files
+    for FILE in "$@"; do
+        if [[ "$(basename "$FILE")" == "$TARGET" ]]; then
+            realpath "$FILE"
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+# Reverse tree: print what includes TARGET, transitively.
+render_includers() {
+    local FILE=$1
+    local DEPTH=$2
+    local INDENT
+    local INCLUDERS
+    local INCLUDER
+
+    INDENT=$(indent_for "$DEPTH")
+
+    if is_root_depth "$DEPTH"; then echo "$(basename "$FILE")"; fi
+
+    within_depth "$DEPTH" || return 0
+    has_includers "$FILE" || return 0
+    INCLUDERS=${FILE_INCLUDES[$FILE]}
+
+    while IFS= read -r INCLUDER; do
+        got "$INCLUDER" || continue
+
+        if is_visited "$INCLUDER"; then
+            printf '%s%s [...]\n' "$INDENT" "$(basename "$INCLUDER")"
+            continue
+        fi
+
+        printf '%s%s\n' "$INDENT" "$(basename "$INCLUDER")"
+        VISITED[$INCLUDER]=1
+
+        render_includers "$INCLUDER" $((DEPTH + 1))
+    done <<< "$INCLUDERS"
+}
+
+# ── main ──────────────────────────────────────────────────────────────────────
+
+main() {
+    local OPT
+    local FILE
+    local TARGET_PATH
+
+    while getopts ":R:sd:I:h-" OPT; do
+        case "$OPT" in
+            R) REVERSE=1; REVERSE_TARGET=$OPTARG ;;
+            s) SHOW_SYSTEM=1 ;;
+            d) is_numeric "$OPTARG" || die "invalid depth: $OPTARG"
+               MAX_DEPTH=$OPTARG ;;
+            I) INCLUDE_DIRS+=("$OPTARG") ;;
+            h) usage; exit 0 ;;
+            -) break ;;
+            *) usage >&2; exit 1 ;;
+        esac
+    done
+    shift $((OPTIND - 1))
+    if [[ "${1:-}" == "--" ]]; then shift; fi
+
+    has_arguments "$@" || { usage >&2; exit 1; }
+
+    if is_reverse; then
+        build_include_map "$@"
+
+        TARGET_PATH=$(find_target "$REVERSE_TARGET" "$@") || die "header not found: $REVERSE_TARGET"
+        render_includers "$TARGET_PATH" 0
+    else
+        for FILE in "$@"; do
+            file_exists "$FILE" || { warn "not found: $FILE"; continue; }
+            render_tree "$FILE" 0
+        done
+    fi
+}
+
+main "$@"
