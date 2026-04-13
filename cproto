@@ -1,68 +1,84 @@
 #!/usr/bin/env bash
-# cproto - Extract C Function Prototypes and Type Definitions
+# cproto — extract C function prototypes and type definitions
 #
-# Parse C source files using clang's AST dump to extract function declarations
-# and type definitions (struct/enum/typedef).
+# WHAT IT DOES
+# Parses C source using clang's AST to extract function declarations and
+# optionally type definitions (struct/enum/typedef). Outputs valid C that
+# can be used as a header file.
 #
-# Usage:
+# HOW IT WORKS
+# 1. Replace shebang with spaces to preserve byte offsets
+# 2. Run clang -ast-dump=json to get full AST (once, reused for all extractions)
+# 3. Filter FunctionDecl nodes, extract return type + params, format as decl
+# 4. If -T: extract TypedefDecl/RecordDecl/EnumDecl via byte ranges
+# 5. If -f: find struct names referenced as pointers but not defined locally
+# 6. If -S: topological sort types by direct (non-pointer) dependencies
+# 7. If -g: wrap output in #ifndef/#define/#endif guards
+# 8. Output: [guards] [forward decls] [types] [functions] [guards]
+#
+# USAGE
 #   cproto [OPTIONS] FILE
 #
-# Options:
-#   -s            Include static functions
-#   -T            Include type definitions (struct/enum/typedef)
-#   -o FILE       Write output to FILE (default: stdout)
-#   -D NAME       Define preprocessor symbol (can be used multiple times)
-#   -I DIR        Add include directory (can be used multiple times)
+# OPTIONS
+#   -s        Include static functions
+#   -T        Include type definitions (struct/enum/typedef)
+#   -g        Wrap output in include guards
+#   -f        Add forward declarations for incomplete types
+#   -S        Sort types by dependency order
+#   -D NAME   Define preprocessor symbol (repeatable)
+#   -I DIR    Add include directory (repeatable)
 #
-# Examples:
-#   cproto foo.c                          # Extract public functions
-#   cproto -s foo.c                       # Include static functions
-#   cproto -T foo.c                       # Include type definitions
-#   cproto -T -I ~/bin ~/bin/rebol.c     # With custom include path
-#   cproto -D IMPLEMENTATION -T stb.h    # Extract from STB-style header
+# EXAMPLES
+#   cproto foo.c                        # public functions only
+#   cproto -s foo.c                     # include static functions
+#   cproto -T foo.c                     # include type definitions
+#   cproto -T foo.c > foo.h             # generate header
+#   cproto -D IMPLEMENTATION -T stb.h   # STB-style header
 #
-# --- How It Works ---
-# 1. Preprocessing: Replace shebang line with spaces to preserve byte offsets
-#    (allows ccraft-style C files with #!/usr/bin/env ccraft shebangs)
-#
-# 2. AST Extraction: Run clang -Xclang -ast-dump=json to get full AST
-#
-# 3. Function Filtering: Use jq to filter AST nodes:
-#    - Select FunctionDecl nodes from source file (not includes)
-#    - Filter by visibility (static vs public based on -s flag)
-#    - Extract return type, function name, and parameter list
-#    - Format as C declaration with semicolon
-#
-# 4. Type Filtering (if -T): Use jq to filter AST nodes:
-#    - Select TypedefDecl, RecordDecl (struct), EnumDecl nodes
-#    - Only complete definitions (not forward declarations)
-#    - Extract byte ranges from AST and read from preprocessed file
-#    - Preserve exact source formatting
-#
-# 5. Output: Combine types (if -T) and functions to stdout
+# DEPENDENCIES
+#   clang, jq
 
 set -euo pipefail
 
-# --- Predicates ---
-
-has_arguments()      { [[ $# -gt 0 ]]; }
-file_exists()        { [[ -f "$1" ]]; }
-is_showing_static()  { [[ $SHOW_STATIC -eq 1 ]]; }
-is_showing_types()   { [[ $SHOW_TYPES -eq 1 ]]; }
-has_range_data()     { [[ -n "$1" && -n "$2" && -n "$3" ]]; }
-has_content()        { [[ -s "$1" ]]; }
-has_semicolon()      { [[ "$1" == *";" ]]; }
+# ============================================================================
+# Configuration
+# ============================================================================
 
 SHOW_STATIC=0
 SHOW_TYPES=0
+SHOW_GUARDS=0
+SHOW_FORWARD=0
+SORT_DEPS=0
 DEFINES=()
 INCLUDES=()
 CLEANUP_FILES=()
 
+# ============================================================================
+# Helpers
+# ============================================================================
+
+die()                { echo "cproto: $*" >&2; exit 1; }
+got()                { [[ -n $1 ]]; }
+has_arguments()      { [[ $# -gt 0 ]]; }
+file_exists()        { [[ -f "$1" ]]; }
+has_content()        { [[ -s "$1" ]]; }
+has_semicolon()      { [[ "$1" == *";" ]]; }
+has_range_data()     { [[ -n "$1" && -n "$2" && -n "$3" ]]; }
+is_showing_static()  { [[ $SHOW_STATIC -eq 1 ]]; }
+is_showing_types()   { [[ $SHOW_TYPES -eq 1 ]]; }
+is_showing_guards()  { [[ $SHOW_GUARDS -eq 1 ]]; }
+is_showing_forward() { [[ $SHOW_FORWARD -eq 1 ]]; }
+is_sorting_deps()    { [[ $SORT_DEPS -eq 1 ]]; }
+
+# ============================================================================
+# Cleanup
+# ============================================================================
+
 cleanup() {
-    local F
-    for F in "${CLEANUP_FILES[@]+"${CLEANUP_FILES[@]}"}"; do
-        rm -f "$F"
+    local FILE
+
+    for FILE in "${CLEANUP_FILES[@]+"${CLEANUP_FILES[@]}"}"; do
+        rm -f "$FILE"
     done
 }
 trap cleanup EXIT
@@ -77,6 +93,10 @@ create_tempfile() {
     echo "$TMPFILE"
 }
 
+# ============================================================================
+# Usage
+# ============================================================================
+
 usage() {
     cat <<EOF
 Usage: cproto [OPTIONS] FILE
@@ -86,18 +106,24 @@ Generate C function prototypes using clang AST.
 Options:
   -s            Include static functions
   -T            Include type definitions (struct/enum/typedef)
-  -D NAME       Define preprocessor symbol (can be used multiple times)
-  -I DIR        Add include directory (can be used multiple times)
+  -g            Wrap output in include guards
+  -f            Add forward declarations for incomplete types
+  -S            Sort types by dependency order
+  -D NAME       Define preprocessor symbol (repeatable)
+  -I DIR        Add include directory (repeatable)
   -h            Show this help
 
 Examples:
   cproto foo.c
   cproto -s foo.c
   cproto -T foo.c
-  cproto -T foo.c > foo.h
-  cproto -D MD_TERM_IMPLEMENTATION foo.h
+  cproto -TgfS foo.c > foo.h
 EOF
 }
+
+# ============================================================================
+# AST Operations
+# ============================================================================
 
 replace_shebang_with_spaces() {
     local SRC=$1
@@ -107,17 +133,29 @@ replace_shebang_with_spaces() {
 }
 
 dump_ast_json() {
+    local STDERR_FILE
+    STDERR_FILE=$(create_tempfile)
+
     clang -x c -fsyntax-only -Xclang -ast-dump=json \
         ${DEFINES[@]+"${DEFINES[@]}"} \
         ${INCLUDES[@]+"${INCLUDES[@]}"} \
-        "$PARSE_FILE" 2>/dev/null
+        "$PARSE_FILE" 2>"$STDERR_FILE" || {
+            sed "s|$PARSE_FILE|$FILE|g" "$STDERR_FILE" >&2
+            die "clang failed to parse $FILE"
+        }
 }
 
-extract_functions() {
-    local SHOW_STATIC_JSON
-    if is_showing_static; then SHOW_STATIC_JSON="true"; else SHOW_STATIC_JSON="false"; fi
+# ============================================================================
+# Function Extraction
+# ============================================================================
 
-    dump_ast_json | jq -r --argjson show_static "$SHOW_STATIC_JSON" '
+extract_functions() {
+    local AST_FILE=$1
+    local SHOW_STATIC_JSON="false"
+
+    if is_showing_static; then SHOW_STATIC_JSON="true"; fi
+
+    jq -r --argjson show_static "$SHOW_STATIC_JSON" '
         def get_params:
             .inner // []
             | map(select(.kind == "ParmVarDecl") | "\(.type.qualType) \(.name // "")")
@@ -148,47 +186,171 @@ extract_functions() {
         | select(is_from_source)
         | select(is_visible)
         | format_decl
-    '
+    ' "$AST_FILE"
 }
 
-extract_type_ranges() {
-    local JSON_FILE=$1
-    local ABS_FILE
-    ABS_FILE=$(realpath "$FILE") || return 1
+# ============================================================================
+# Type Extraction
+# ============================================================================
 
-    jq -r --arg file "$ABS_FILE" '
+extract_defined_types() {
+    local AST_FILE=$1
+
+    jq -r '
+        .inner[]?
+        | select(.kind == "RecordDecl" or .kind == "EnumDecl")
+        | select(.completeDefinition == true)
+        | select(.name != null and .name != "")
+        | (if .kind == "RecordDecl" then (if .tagUsed == "union" then "union" else "struct" end) else "enum" end) as $tag
+        | "\($tag) \(.name)"
+    ' "$AST_FILE" | sort -u
+}
+
+extract_referenced_types() {
+    local AST_FILE=$1
+
+    jq -r '
+        def find_pointer_types:
+            .. | objects | select(.kind == "PointerType") | .inner[]? | select(.kind == "RecordType") | .decl.name // empty;
+
+        .inner[]?
+        | select(.kind == "RecordDecl")
+        | select(.completeDefinition == true)
+        | find_pointer_types
+    ' "$AST_FILE" | sort -u
+}
+
+emit_forward_declarations() {
+    local AST_FILE=$1
+    local DEFINED
+    local REFERENCED
+    local TYPE
+
+    DEFINED=$(extract_defined_types "$AST_FILE")
+    REFERENCED=$(extract_referenced_types "$AST_FILE")
+
+    while IFS= read -r TYPE; do
+        got "$TYPE" || continue
+        echo "$DEFINED" | grep -q "struct $TYPE" || echo "struct $TYPE;"
+    done <<< "$REFERENCED"
+}
+
+# Extract type declarations from AST with byte ranges and dependencies.
+# Filters: TypedefDecl/RecordDecl/EnumDecl from target file, complete, with valid range.
+# Output: name\tbegin\tend\ttokLen\tdeps (deps = direct non-pointer struct/union/enum refs)
+extract_type_info() {
+    local AST_FILE=$1
+    local ABS_FILE
+    local REL_FILE
+    ABS_FILE=$(realpath "$FILE") || return 1
+    REL_FILE=$FILE
+
+    jq -r --arg absfile "$ABS_FILE" --arg relfile "$REL_FILE" --arg parsefile "$PARSE_FILE" '
         def is_type_decl:
             .kind == "TypedefDecl" or .kind == "RecordDecl" or .kind == "EnumDecl";
-        
+
         def is_from_target_file:
-            .loc.file == $file or (.loc.file == null and .loc.offset != null);
-        
+            .loc.file == $absfile or .loc.file == $relfile or .loc.file == $parsefile or (.loc.file == null and .loc.offset != null);
+
         def has_name:
             .name != null and .name != "";
-        
+
         def is_not_included:
             .loc.includedFrom | not;
-        
+
         def is_complete:
             if .kind == "RecordDecl" or .kind == "EnumDecl"
             then .completeDefinition == true
             else true
             end;
-        
+
         def has_valid_range:
             .range.begin.offset != null
             and .range.end.offset != null
             and .range.end.tokLen != null;
-        
-        .inner[]
+
+        def get_direct_deps:
+            [.. | objects | select(.kind == "FieldDecl")
+             | .type.qualType // ""
+             | select(test("\\*") | not)
+             | capture("(?<tag>struct|union|enum) (?<name>[a-zA-Z_][a-zA-Z0-9_]*)") | .name
+            ] | unique | join(",");
+
+        .inner[]?
         | select(is_type_decl)
         | select(is_from_target_file)
         | select(has_name)
         | select(is_not_included)
         | select(is_complete)
         | select(has_valid_range)
-        | "\(.range.begin.offset) \(.range.end.offset) \(.range.end.tokLen)"
-    ' "$JSON_FILE" | sort -n -u
+        | .name as $name
+        | .range.begin.offset as $begin
+        | .range.end.offset as $end
+        | .range.end.tokLen as $toklen
+        | get_direct_deps as $deps
+        | "\($name)\t\($begin)\t\($end)\t\($toklen)\t\($deps)"
+    ' "$AST_FILE"
+}
+
+# Topological sort (Kahn's algorithm) — emit types before their dependents.
+# Falls back to original order if cycle detected.
+topo_sort() {
+    awk -F'\t' '
+    {
+        type_name[NR] = $1
+        begin[NR] = $2
+        end[NR] = $3
+        toklen[NR] = $4
+        dep_list[NR] = $5
+        name_to_idx[$1] = NR
+        type_count++
+    }
+    END {
+        for (i = 1; i <= type_count; i++) {
+            in_degree[i] = 0
+            split(dep_list[i], deps, ",")
+            for (j in deps) {
+                dep = deps[j]
+                if (dep != "" && name_to_idx[dep] != "") {
+                    provider = name_to_idx[dep]
+                    dependent = i
+                    adjacency[provider, ++adj_count[provider]] = dependent
+                    in_degree[dependent]++
+                }
+            }
+        }
+
+        head = 1; tail = 0
+        for (i = 1; i <= type_count; i++)
+            if (in_degree[i] == 0) queue[++tail] = i
+
+        sorted_count = 0
+        while (head <= tail) {
+            current = queue[head++]
+            sorted[++sorted_count] = current
+            for (j = 1; j <= adj_count[current]; j++) {
+                neighbor = adjacency[current, j]
+                if (--in_degree[neighbor] == 0) queue[++tail] = neighbor
+            }
+        }
+
+        has_cycle = (sorted_count != type_count)
+        for (i = 1; i <= type_count; i++) {
+            idx = has_cycle ? i : sorted[i]
+            print begin[idx], end[idx], toklen[idx]
+        }
+    }
+    '
+}
+
+extract_type_ranges() {
+    local AST_FILE=$1
+
+    if is_sorting_deps; then
+        extract_type_info "$AST_FILE" | topo_sort
+    else
+        extract_type_info "$AST_FILE" | cut -f2,3,4 | tr '\t' ' ' | sort -n -u
+    fi
 }
 
 extract_source_range() {
@@ -196,7 +358,7 @@ extract_source_range() {
     local BEGIN=$2
     local END=$3
     local TOKLEN=$4
-    local COUNT=$((END - BEGIN + TOKLEN + 1))
+    local COUNT=$((END - BEGIN + TOKLEN))
 
     dd if="$SOURCE_FILE" bs=1 skip="$BEGIN" count="$COUNT" status=none 2>/dev/null
 }
@@ -204,8 +366,8 @@ extract_source_range() {
 emit_type_definition() {
     local TEXT=$1
 
+    has_semicolon "$TEXT" || TEXT="$TEXT;"
     echo "$TEXT"
-    if ! has_semicolon "$TEXT"; then echo ";"; fi
     echo ""
 }
 
@@ -224,35 +386,85 @@ extract_types() {
     done
 }
 
-extract_prototypes() {
-    local FUNCTIONS
-    FUNCTIONS=$(extract_functions)
-    
-    is_showing_types || { echo "$FUNCTIONS"; return 0; }
+# ============================================================================
+# Orchestration
+# ============================================================================
 
+guard_name() {
+    local NAME
+
+    NAME=$(basename "$FILE")
+    NAME=${NAME%.*}
+    NAME=${NAME^^}
+    NAME=${NAME//[^A-Z0-9]/_}
+    echo "${NAME}_H"
+}
+
+emit_guard_begin() {
+    local GUARD
+
+    GUARD=$(guard_name)
+    echo "#ifndef $GUARD"
+    echo "#define $GUARD"
+    echo ""
+}
+
+emit_guard_end() {
+    local GUARD
+
+    GUARD=$(guard_name)
+    echo ""
+    echo "#endif /* $GUARD */"
+}
+
+extract_prototypes() {
     local TMPFILE_AST
     local TMPFILE_TYPES
+    local TMPFILE_FORWARD
+    local FUNCTIONS
 
     TMPFILE_AST=$(create_tempfile)
-    TMPFILE_TYPES=$(create_tempfile)
-
     dump_ast_json > "$TMPFILE_AST"
+
+    FUNCTIONS=$(extract_functions "$TMPFILE_AST")
+
+    is_showing_types || { echo "$FUNCTIONS"; return 0; }
+
+    if is_showing_forward; then
+        TMPFILE_FORWARD=$(create_tempfile)
+        emit_forward_declarations "$TMPFILE_AST" > "$TMPFILE_FORWARD"
+        if has_content "$TMPFILE_FORWARD"; then
+            cat "$TMPFILE_FORWARD"
+            echo ""
+        fi
+    fi
+
+    TMPFILE_TYPES=$(create_tempfile)
     extract_types "$TMPFILE_AST" "$PARSE_FILE" > "$TMPFILE_TYPES"
-    
+
     if has_content "$TMPFILE_TYPES"; then
         cat "$TMPFILE_TYPES"
-        echo ""
-        echo ""
     fi
 
     echo "$FUNCTIONS"
 }
 
+emit_output() {
+    if is_showing_guards; then emit_guard_begin; fi
+
+    extract_prototypes
+
+    if is_showing_guards; then emit_guard_end; fi
+}
+
 main() {
-    while getopts "sTD:I:h" OPT; do
+    while getopts "sTgfSD:I:h" OPT; do
         case "$OPT" in
             s) SHOW_STATIC=1 ;;
             T) SHOW_TYPES=1 ;;
+            g) SHOW_GUARDS=1 ;;
+            f) SHOW_FORWARD=1 ;;
+            S) SORT_DEPS=1 ;;
             D) DEFINES+=("-D$OPTARG") ;;
             I) INCLUDES+=("-I$OPTARG") ;;
             h) usage; exit 0 ;;
@@ -264,14 +476,12 @@ main() {
     has_arguments "$@" || { usage >&2; exit 1; }
 
     FILE=$1
-    file_exists "$FILE" || { echo "error: file not found: $FILE" >&2; exit 1; }
+    file_exists "$FILE" || die "file not found: $FILE"
 
-    TMPFILE_SRC=$(create_tempfile)
+    PARSE_FILE=$(create_tempfile)
+    replace_shebang_with_spaces "$FILE" "$PARSE_FILE"
 
-    replace_shebang_with_spaces "$FILE" "$TMPFILE_SRC"
-    PARSE_FILE=$TMPFILE_SRC
-
-    extract_prototypes
+    emit_output
 }
 
 main "$@"
