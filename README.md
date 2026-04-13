@@ -192,7 +192,7 @@ validate   function   examples/cflow.c   40   reference
 
 ## Dependencies
 
-- C compiler (`cc` or `$CC`)
+- C compiler, `cc` or `$CC`
 - POSIX shell, `sed`, `md5sum`, `gawk`
 - Analysis tools: `clang`, `jq`
-- Formatting: `clang-format` or `indent`
+- Formatting: `clang-format`, `indent`

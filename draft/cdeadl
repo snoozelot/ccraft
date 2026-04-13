@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# cdeadl — detect potential deadlocks in C source
+# cdeadl - detect potential deadlocks in C source
 #
 # WHAT IT DOES
 # If deposit() locks config then account, and withdraw() locks account then
-# config — they can deadlock. This tool finds such contradictions in C source.
+# config - they can deadlock. This tool finds such contradictions in C source.
 #
 # Two modes:
 #   Inference mode (default): finds contradictions in lock ordering across paths
@@ -27,18 +27,16 @@
 #   - No need for --same when instances have the same type
 #
 # LEVEL DECLARATION
-# Levels are declared via CLI/config:
-#   --level 2 Account.mu    # struct field
-#   --level 1 g_config      # global variable
-#
-# Source annotations via __attribute__((annotate("lock_level=N"))) are not yet
-# supported because clang's JSON AST dump omits annotation string values.
+# Levels can be declared via:
+#   1. Source comments (preferred):
+#      pthread_mutex_t g_config;  // lock_level=1
+#   2. CLI: --level 2 Account.mu
 #
 # See: https://notes.brooklynzelenka.com/Blog/Surelock
 #
 # HOW IT WORKS
-# 1. clang -ast-dump=json — parses each source file into an AST
-# 2. jq — extract type-based lock identity from FieldDecl/VarDecl,
+# 1. clang -ast-dump=json - parses each source file into an AST
+# 2. jq - extract type-based lock identity from FieldDecl/VarDecl,
 #    expand interprocedurally, track held locks, generate pairs, detect cycles
 #
 # USAGE
@@ -60,25 +58,35 @@
 #   --trylock FN...      nonblocking lock functions, not counted as held
 #   --slock FN...        shared/readonly lock functions, don't conflict
 #   --lockset LOCK...    locks acquired atomically together, no conflict within
-#   --config FILE        load settings from file
 #
 # EXAMPLES
-#   # Detect deadlocks (inference mode)
-#   cdeadl examples/deadlock.c
-#   → deadlock: Account.mu vs Config.mu
-#       Account.mu:54 → Config.mu:55
-#       Config.mu:92 → Account.mu:93
+#   # Inference mode - detects contradictory lock orders
+#   # Given bank.c:
+#   #   void deposit(Account *a)  { lock(&a->mu); lock(&g_config); ... }
+#   #   void withdraw(Account *a) { lock(&g_config); lock(&a->mu); ... }
+#   cdeadl bank.c
+#   → deadlock: Account.mu vs g_config
+#       deposit(): Account.mu:N → g_config:M
+#       withdraw(): g_config:N → Account.mu:M
 #
-#     deadlock: Account.mu → Logger.mu → Config.mu → Account.mu
-#       Account.mu:72 → Logger.mu:73
-#       ...
+#   # Level mode with source annotations (preferred)
+#   # Given bank.c:
+#   #   pthread_mutex_t g_config;  // lock_level=1
+#   #   typedef struct {
+#   #       pthread_mutex_t mu;    // lock_level=2
+#   #   } Account;
+#   #   void withdraw(Account *a) {
+#   #       lock(&a->mu);      // level 2
+#   #       lock(&g_config);   // level 1 - violation!
+#   #   }
+#   cdeadl bank.c
+#   → level violation: Account.mu vs g_config
+#       withdraw(): Account.mu:N → g_config:M (level 2 → 1)
 #
-#   # Verify lock ordering (level mode)
-#   cdeadl --level 1 Config.mu --level 2 Account.mu examples/deadlock-levels.c
-#   → level violation in withdraw(): Config.mu (level 1, line 43) acquired after Account.mu (level 2, line 42)
+#   # Level mode with CLI flags
+#   cdeadl --level 1 g_config --level 2 Account.mu bank.c
 #
-#   # Real usage
-#   cdeadl src/*.c
+#   # Locks acquired atomically together (no conflict within set)
 #   cdeadl --lockset Account.mu Transaction.mu src/*.c
 #
 # EXIT CODES
@@ -126,6 +134,7 @@ is_source_file()      { [[ $1 == *.c || $1 == *.h ]]; }
 is_option_value()     { ! is_option "$1" && ! is_source_file "$1"; }
 more_option_values()  { has_arguments "$@" && is_option_value "$1"; }
 jq_failed()           { [[ $JQ_EXIT -ne 0 ]]; }
+has_json_items()      { [[ $1 != '[]' ]]; }
 
 array_to_json()  { local -n A=$1; printf '%s\n' "${A[@]}" | jq -R . | jq -s .; }
 add_words_to()   { local -n LIST=$1; local WORDS; read -ra WORDS <<< "$2"; LIST+=("${WORDS[@]}"); }
@@ -138,7 +147,10 @@ groups_to_json() {
     | jq -s .
 }
 levels_to_json() {
-    local ENTRY LVL LOCKS LOCK
+    local ENTRY
+    local LVL
+    local LOCKS
+    local LOCK
 
     for ENTRY in "${LEVELS[@]}"; do
         LVL=${ENTRY%%:*}
@@ -169,7 +181,6 @@ Options:
   --trylock FN...    nonblocking, not counted as held
   --slock FN...      shared/readonly, don't conflict with each other
   --lockset LOCK...  locks acquired atomically, no conflict within set
-  --config FILE      load settings from file
 
 Examples:
   cdeadl src/*.c                                    # inference mode
@@ -178,43 +189,11 @@ Examples:
 EOF
 }
 
-# ── config file ───────────────────────────────────────────────────────────────
-
-load_config() {
-    local FILE=$1
-    local LINE
-    file_exists "$FILE" || die "config not found: $FILE"
-    
-    while IFS= read -r LINE || [[ -n $LINE ]]; do
-        LINE=${LINE%%#*}
-        LINE=${LINE%"${LINE##*[![:space:]]}"}
-        LINE=${LINE#"${LINE%%[![:space:]]*}"}
-        got "$LINE" || continue
-        
-        if [[ $LINE =~ ^level[[:space:]]+([0-9]+)[[:space:]]+(.+)$ ]]; then
-            LEVEL_MODE=1
-            LEVELS+=("${BASH_REMATCH[1]}:${BASH_REMATCH[2]// /,}")
-        elif [[ $LINE =~ ^lockset[[:space:]]+(.+)$ ]]; then
-            LOCKSET_GROUPS+=("${BASH_REMATCH[1]// /,}")
-        elif [[ $LINE =~ ^ignore[[:space:]]+(.+)$ ]]; then
-            add_words_to IGNORE_LIST "${BASH_REMATCH[1]}"
-        elif [[ $LINE =~ ^trylock[[:space:]]+(.+)$ ]]; then
-            add_words_to TRYLOCK_LIST "${BASH_REMATCH[1]}"
-        elif [[ $LINE =~ ^slock[[:space:]]+(.+)$ ]]; then
-            add_words_to SLOCK_LIST "${BASH_REMATCH[1]}"
-        elif [[ $LINE =~ ^acquire[[:space:]]+(.+)$ ]]; then
-            add_words_to ACQUIRE_LIST "${BASH_REMATCH[1]}"
-        elif [[ $LINE =~ ^release[[:space:]]+(.+)$ ]]; then
-            add_words_to RELEASE_LIST "${BASH_REMATCH[1]}"
-        fi
-    done < "$FILE"
-}
-
 # ── argument parsing ──────────────────────────────────────────────────────────
 
 parse_args() {
     local -a FILES=()
-    
+
     while has_arguments "$@"; do
         case "$1" in
             -a) ACQUIRE_LIST+=("$2"); shift 2 ;;
@@ -223,7 +202,7 @@ parse_args() {
             -I) INCLUDES+=("-I$2"); shift 2 ;;
             -v) VERBOSE=1; shift ;;
             -h) usage; exit 0 ;;
-            
+
             --level)
                 shift
                 arg_count_ge 2 "$@" || die "--level requires N and at least one LOCK"
@@ -266,11 +245,7 @@ parse_args() {
                     SLOCK_LIST+=("$1"); shift
                 done
                 ;;
-            
-            --config)
-                load_config "$2"; shift 2
-                ;;
-            
+
             --)
                 shift; break
                 ;;
@@ -286,7 +261,7 @@ parse_args() {
     done
 
     FILES+=("$@")
-    
+
     POSITIONAL=("${FILES[@]+"${FILES[@]}"}")
 }
 
@@ -297,11 +272,8 @@ json_or_default() {
     local NAME=$1
     local DEFAULT=$2
 
-    if has_items "$NAME"; then
-        array_to_json "$NAME"
-    else
-        echo "$DEFAULT"
-    fi
+    has_items "$NAME" || { echo "$DEFAULT"; return 0; }
+    array_to_json "$NAME"
 }
 
 # Merge trylock/slock into acquire list
@@ -309,11 +281,8 @@ merge_lock_fns() {
     local ACQUIRE=$1
     local EXTRA=$2
 
-    if [[ $EXTRA != '[]' ]]; then
-        jq -n --argjson a "$ACQUIRE" --argjson e "$EXTRA" '$a + $e'
-    else
-        echo "$ACQUIRE"
-    fi
+    has_json_items "$EXTRA" || { echo "$ACQUIRE"; return 0; }
+    jq -n --argjson a "$ACQUIRE" --argjson e "$EXTRA" '$a + $e'
 }
 
 build_config() {
@@ -335,17 +304,11 @@ build_config() {
     ACQUIRE=$(merge_lock_fns "$ACQUIRE" "$TRYLOCK")
     ACQUIRE=$(merge_lock_fns "$ACQUIRE" "$SLOCK")
 
-    if has_items LOCKSET_GROUPS; then
-        LOCKSET=$(groups_to_json LOCKSET_GROUPS)
-    else
-        LOCKSET='[]'
-    fi
+    LOCKSET='[]'
+    if has_items LOCKSET_GROUPS; then LOCKSET=$(groups_to_json LOCKSET_GROUPS); fi
 
-    if has_items LEVELS; then
-        LEVELS_JSON=$(levels_to_json)
-    else
-        LEVELS_JSON='{}'
-    fi
+    LEVELS_JSON='{}'
+    if has_items LEVELS; then LEVELS_JSON=$(levels_to_json); fi
 
     jq -n \
         --argjson acquire "$ACQUIRE" \
@@ -374,13 +337,23 @@ build_config() {
 
 write_jq_program() {
     cat << 'ENDJQ'
+# ── constants ─────────────────────────────────────────────────────────────────
+
+def LOCK_EVENT:   "L";
+def UNLOCK_EVENT: "U";
+def CALL_EVENT:   "C";
+def READ_LOCK:    "R";
+def WRITE_LOCK:   "W";
+def MIN_CYCLE:    3;
+def MAX_PATH:     10;
+
 # ── predicates ────────────────────────────────────────────────────────────────
 
-def is_acquire: . as $n | $config.acquire | any(. == $n);
-def is_release: . as $n | $config.release | any(. == $n);
-def is_trylock: . as $n | $config.trylock | any(. == $n);
-def is_slock:   . as $n | $config.slock   | any(. == $n);
-def is_ignored: . as $n | $config.ignore  | any(. == $n);
+def is_acquire: . as $name | $config.acquire | any(. == $name);
+def is_release: . as $name | $config.release | any(. == $name);
+def is_trylock: . as $name | $config.trylock | any(. == $name);
+def is_slock:   . as $name | $config.slock   | any(. == $name);
+def is_ignored: . as $name | $config.ignore  | any(. == $name);
 
 def is_wrapper:      .kind? == "UnaryOperator" or .kind? == "ImplicitCastExpr" or .kind? == "ParenExpr";
 def is_array_sub:    .kind? == "ArraySubscriptExpr";
@@ -392,15 +365,15 @@ def is_body:         .kind? == "CompoundStmt";
 def is_call:         .kind? == "CallExpr";
 def is_local:        .loc.includedFrom | not;
 def has_body:        any(.inner[]?; is_body);
-def is_lock_event:   .type == "L";
-def is_unlock_event: .type == "U";
-def is_call_event:   .type == "C";
+def is_lock_event:   .type == LOCK_EVENT;
+def is_unlock_event: .type == UNLOCK_EVENT;
+def is_call_event:   .type == CALL_EVENT;
 
 def same_lock($a; $b):        $a == $b;
 def both_readers($ta; $tb):   $ta == "R" and $tb == "R";
 
 def in_lockset($a; $b):
-    $config.lockset | any(. as $s | ($s | any(. == $a)) and ($s | any(. == $b)));
+    $config.lockset | any(. as $set | ($set | any(. == $a)) and ($set | any(. == $b)));
 
 def no_conflict($held_lock; $held_type; $new_lock; $new_type):
     same_lock($held_lock; $new_lock) or
@@ -429,8 +402,8 @@ def lock_type_key:
     elif is_wrapper then inner | lock_type_key
     elif is_array_sub then inner | lock_type_key
     elif is_member then
-        base_type as $t | field as $f |
-        if $t != "" and $t != "?" then "\($t).\($f)" else $f end
+        base_type as $type | field as $name |
+        if $type != "" and $type != "?" then "\($type).\($name)" else $name end
     else null end;
 
 # Instance path for display: ptr->mu
@@ -440,7 +413,7 @@ def expr_path:
     if . == null then null
     elif is_decl_ref then ref_name
     elif is_wrapper then inner | expr_path
-    elif is_array_sub then (inner | expr_path) as $b | if $b then "\($b)[]" else null end
+    elif is_array_sub then (inner | expr_path) as $base | if $base then "\($base)[]" else null end
     elif is_member then
         (inner | expr_path) as $base |
         if $base then "\($base)\(arrow_or_dot)\(field)" else null end
@@ -455,9 +428,9 @@ def call_args:
     [.inner[1:][]? | lock_type_key | select(. != null)];
 
 def event_type($fn):
-    if $fn | is_acquire then "L"
-    elif $fn | is_release then "U"
-    else "C" end;
+    if $fn | is_acquire then LOCK_EVENT
+    elif $fn | is_release then UNLOCK_EVENT
+    else CALL_EVENT end;
 
 # ── function extraction ───────────────────────────────────────────────────────
 
@@ -478,10 +451,13 @@ def extract_event:
     };
 
 def extract_function:
+    (.loc.line // .range.begin.line // 0) as $fn_line |
     {
         name: .name,
         params: [.inner[]? | select(is_param) | extract_param],
-        events: [.. | select(is_call) | extract_event] | sort_by(.offset)
+        events: [.. | select(is_call) | extract_event |
+            if .line == 0 then .line = $fn_line else . end
+        ] | sort_by(.offset)
     };
 
 def extract_functions:
@@ -491,10 +467,10 @@ def extract_functions:
 # ── parameter substitution ────────────────────────────────────────────────────
 
 def build_subst($params; $args):
-    reduce range($params | length) as $i ({};
-        $params[$i] as $p | ($args[$i] // null) as $a |
-        if $p.name != "" and $a != null then
-            .[$p.name] = {type_key: $a, struct_type: $p.type}
+    reduce range($params | length) as $idx ({};
+        $params[$idx] as $param | ($args[$idx] // null) as $arg |
+        if $param.name != "" and $arg != null then
+            .[$param.name] = {type_key: $arg, struct_type: $param.type}
         else . end
     );
 
@@ -504,29 +480,29 @@ def substitute($subst):
     else
         (first(
             $subst | to_entries[] |
-            .key as $k | .value as $v |
-            select($lock == $k or ($lock | startswith("\($k)->")) or ($lock | startswith("\($k)."))) |
-            {key: $k, type_key: $v.type_key, struct: $v.struct_type}
+            .key as $key | .value as $val |
+            select($lock == $key or ($lock | startswith("\($key)->")) or ($lock | startswith("\($key)."))) |
+            {key: $key, type_key: $val.type_key, struct: $val.struct_type}
         ) // null) as $match |
         if $match == null then $lock
         elif $lock == $match.key then $match.type_key
         else
-            ($lock | sub("^\($match.key)[->.]"; "")) as $f |
-            if $match.struct != "" then "\($match.struct).\($f)" else $match.type_key end
+            ($lock | sub("^\($match.key)[->.]"; "")) as $suffix |
+            if $match.struct != "" then "\($match.struct).\($suffix)" else $match.type_key end
         end
     end;
 
 # ── lock tracking ─────────────────────────────────────────────────────────────
 
-def lock_type($fn): if $fn | is_slock then "R" else "W" end;
+def lock_type($fn): if $fn | is_slock then READ_LOCK else WRITE_LOCK end;
 
-def record_pair($held; $lock; $ltype; $line):
-    {a: $held.lock, b: $lock, ta: $held.ltype, tb: $ltype, la: $held.line, lb: $line};
+def record_pair($fn; $held; $lock; $ltype; $line):
+    {fn: $fn, from: $held.lock, to: $lock, from_type: $held.ltype, to_type: $ltype, from_line: $held.line, to_line: $line};
 
-def add_pairs($lock; $ltype; $line):
-    reduce (.held | to_entries[]) as $e (.;
-        if no_conflict($e.key; $e.value.ltype; $lock; $ltype) then .
-        else .pairs += [record_pair({lock: $e.key, ltype: $e.value.ltype, line: $e.value.line}; $lock; $ltype; $line)]
+def add_pairs($fn; $lock; $ltype; $line):
+    reduce (.held | to_entries[]) as $entry (.;
+        if no_conflict($entry.key; $entry.value.ltype; $lock; $ltype) then .
+        else .pairs += [record_pair($fn; {lock: $entry.key, ltype: $entry.value.ltype, line: $entry.value.line}; $lock; $ltype; $line)]
         end
     );
 
@@ -534,8 +510,8 @@ def hold_lock($lock; $ltype; $path; $line):
     .held[$lock] = {ltype: $ltype, path: $path, line: $line} |
     .sequence += [{lock: $lock, type: $ltype, path: $path, line: $line}];
 
-def process_lock($lock; $ltype; $path; $line):
-    add_pairs($lock; $ltype; $line) | hold_lock($lock; $ltype; $path; $line);
+def process_lock($fn; $lock; $ltype; $path; $line):
+    add_pairs($fn; $lock; $ltype; $line) | hold_lock($lock; $ltype; $path; $line);
 
 # ── interprocedural expansion ─────────────────────────────────────────────────
 
@@ -555,7 +531,7 @@ def expand($funcs; $fn; $params; $args; $held; $expanding):
             if $ev | is_lock_event then
                 resolve_lock($ev; $subst) as $lock |
                 if skip_lock($lock; $ev.fn) then .
-                else process_lock($lock; lock_type($ev.fn); $ev.path; $ev.line) end
+                else process_lock($fn; $lock; lock_type($ev.fn); $ev.path; $ev.line) end
             elif $ev | is_unlock_event then
                 resolve_lock($ev; $subst) as $lock |
                 if $lock == "" then . else del(.held[$lock]) end
@@ -572,21 +548,26 @@ def expand($funcs; $fn; $params; $args; $held; $expanding):
 
 # ── level verification ────────────────────────────────────────────────────────
 
-def level_error($fn; $item; $level):
-    "level violation in \($fn)(): \($item.lock) (level \($level), line \($item.line)) acquired after \(.prev_lock) (level \(.prev_level), line \(.prev_line))";
+def level_violation($fn; $prev; $curr; $prev_level; $curr_level):
+    {type: "level", lock_a: $prev.lock, lock_b: $curr.lock,
+     fn: $fn, line_a: $prev.line, line_b: $curr.line,
+     level_a: $prev_level, level_b: $curr_level};
 
-def same_level_error($fn; $item; $level):
-    "same-level conflict in \($fn)(): \($item.lock) (line \($item.line)) and \(.prev_lock) (line \(.prev_line)) both at level \($level)";
+def same_level_violation($fn; $prev; $curr; $level):
+    {type: "same", lock_a: $prev.lock, lock_b: $curr.lock,
+     fn: $fn, line_a: $prev.line, line_b: $curr.line, level: $level};
 
-def no_level_error($item; $fn):
-    "no level declared for: \($item.lock) (in \($fn), line \($item.line))";
+def no_level_violation($fn; $item):
+    {type: "none", lock: $item.lock, fn: $fn, line: $item.line};
 
 def check_level($fn; $item):
     ($item.lock | get_level) as $level |
-    if $level == null then .violations += [no_level_error($item; $fn)]
-    elif $level < .prev_level then .violations += [level_error($fn; $item; $level)]
+    if $level == null then
+        .violations += [no_level_violation($fn; $item)]
+    elif $level < .prev_level then
+        .violations += [level_violation($fn; {lock: .prev_lock, line: .prev_line}; $item; .prev_level; $level)]
     elif $level == .prev_level and $item.lock != .prev_lock then
-        .violations += [same_level_error($fn; $item; $level)]
+        .violations += [same_level_violation($fn; {lock: .prev_lock, line: .prev_line}; $item; $level)]
     else . end |
     .prev_lock = $item.lock |
     .prev_level = ($level // .prev_level) |
@@ -602,12 +583,12 @@ def verify_levels($fn; $seq):
 def edge_key($a; $b): "\($a)→\($b)";
 
 def add_edge($pair):
-    .edges[$pair.a] = ((.edges[$pair.a] // []) + [$pair.b] | unique) |
-    .has_write[edge_key($pair.a; $pair.b)] = ($pair.ta == "W" or $pair.tb == "W") |
-    .edge_lines[edge_key($pair.a; $pair.b)] = {held: $pair.la, acquired: $pair.lb};
+    .edges[$pair.from] = ((.edges[$pair.from] // []) + [$pair.to] | unique) |
+    .has_write[edge_key($pair.from; $pair.to)] = ($pair.from_type == WRITE_LOCK or $pair.to_type == WRITE_LOCK) |
+    .edge_lines[edge_key($pair.from; $pair.to)] = {fn: $pair.fn, held: $pair.from_line, acquired: $pair.to_line};
 
 def build_graph:
-    reduce .[] as $p ({edges: {}, has_write: {}, edge_lines: {}}; add_edge($p));
+    reduce .[] as $pair ({edges: {}, has_write: {}, edge_lines: {}}; add_edge($pair));
 
 # ── cycle detection ───────────────────────────────────────────────────────────
 
@@ -618,14 +599,14 @@ def either_write($a; $b):
     edge_is_write($a; $b) or edge_is_write($b; $a);
 
 def find_2lock_conflicts:
-    . as $g |
-    [$g.edges | to_entries[] | .key as $a | .value[] | . as $b |
-        select($a < $b) |
-        select($g | has_reverse_edge($a; $b)) |
-        select($g | either_write($a; $b)) |
-        {a: $a, b: $b,
-         ab: $g.edge_lines[edge_key($a; $b)],
-         ba: $g.edge_lines[edge_key($b; $a)]}
+    . as $graph |
+    [$graph.edges | to_entries[] | .key as $lock_a | .value[] | . as $lock_b |
+        select($lock_a < $lock_b) |
+        select($graph | has_reverse_edge($lock_a; $lock_b)) |
+        select($graph | either_write($lock_a; $lock_b)) |
+        {lock_a: $lock_a, lock_b: $lock_b,
+         edge_ab: $graph.edge_lines[edge_key($lock_a; $lock_b)],
+         edge_ba: $graph.edge_lines[edge_key($lock_b; $lock_a)]}
     ];
 
 # Rotate cycle to canonical form (smallest element first)
@@ -638,8 +619,8 @@ def cycle_key: join("→");
 
 def cycle_has_write($graph):
     . as $path |
-    reduce range(length) as $i (false;
-        . or ($graph | edge_is_write($path[$i]; $path[($i+1) % ($path | length)]))
+    reduce range(length) as $idx (false;
+        . or ($graph | edge_is_write($path[$idx]; $path[($idx+1) % ($path | length)]))
     );
 
 def path_contains($node): any(. == $node);
@@ -647,7 +628,7 @@ def path_contains($node): any(. == $node);
 def extend_path($graph; $path; $seen):
     ($path | last) as $cur |
     reduce ($graph.edges[$cur] // [])[] as $next ({stack: [], found: [], seen: $seen};
-        if $next == $path[0] and ($path | length) >= 3 then
+        if $next == $path[0] and ($path | length) >= MIN_CYCLE then
             ($path | normalize_cycle) as $norm |
             ($norm | cycle_key) as $key |
             if .seen[$key] then .
@@ -655,7 +636,7 @@ def extend_path($graph; $path; $seen):
                 .found += [$norm] | .seen[$key] = true
             else . end
         elif ($path | path_contains($next)) then .
-        elif ($path | length) >= 10 then .
+        elif ($path | length) >= MAX_PATH then .
         else .stack += [$path + [$next]]
         end
     );
@@ -670,34 +651,35 @@ def find_all_cycles:
             extend_path($graph; $path; .seen) as $ext |
             .stack += $ext.stack | .result += $ext.found | .seen = $ext.seen
         ) | {cycles: .result, seen: .seen}
-    ) | [.cycles[] | select(length >= 3)];
+    ) | [.cycles[] | select(length >= MIN_CYCLE)];
 
 # ── output formatting ─────────────────────────────────────────────────────────
 
-def format_2lock($c):
-    "deadlock: \($c.a) vs \($c.b)",
-    "  \($c.a):\($c.ab.held) → \($c.b):\($c.ab.acquired)",
-    "  \($c.b):\($c.ba.held) → \($c.a):\($c.ba.acquired)";
+def format_2lock($conflict):
+    "deadlock: \($conflict.lock_a) vs \($conflict.lock_b)",
+    "  \($conflict.edge_ab.fn)(): \($conflict.lock_a):\($conflict.edge_ab.held) → \($conflict.lock_b):\($conflict.edge_ab.acquired)",
+    "  \($conflict.edge_ba.fn)(): \($conflict.lock_b):\($conflict.edge_ba.held) → \($conflict.lock_a):\($conflict.edge_ba.acquired)";
 
-def format_cycle($c; $graph):
-    "deadlock: \($c | join(" → ")) → \($c[0])",
-    (reduce range($c | length) as $i ([];
-        ($c[$i]) as $a | ($c[($i+1) % ($c | length)]) as $b |
-        . + ["  \($a):\($graph.edge_lines[edge_key($a; $b)].held) → \($b):\($graph.edge_lines[edge_key($a; $b)].acquired)"]
+def format_cycle($cycle; $graph):
+    "deadlock: \($cycle | join(" → ")) → \($cycle[0])",
+    (reduce range($cycle | length) as $idx ([]; 
+        ($cycle[$idx]) as $lock_a | ($cycle[($idx+1) % ($cycle | length)]) as $lock_b |
+        ($graph.edge_lines[edge_key($lock_a; $lock_b)]) as $edge |
+        . + ["  \($edge.fn)(): \($lock_a):\($edge.held) → \($lock_b):\($edge.acquired)"]
     ) | .[]);
 
 def format_verbose($pairs):
-    "lock orderings found:", ($pairs[] | "  \(.a):\(.la) → \(.b):\(.lb)");
+    "lock orderings found:", ($pairs[] | "  \(.fn)(): \(.from):\(.from_line) → \(.to):\(.to_line)");
 
-def format_results($pairs; $c2; $cn; $graph):
+def format_results($pairs; $pair_conflicts; $cycle_conflicts; $graph):
     (if $config.verbose then format_verbose($pairs) else empty end),
-    (if ($c2 | length) > 0 then
+    (if ($pair_conflicts | length) > 0 then
         (if $config.verbose then "" else empty end),
-        ($c2 | to_entries[] | (if .key > 0 then "" else empty end), format_2lock(.value))
+        ($pair_conflicts | to_entries[] | (if .key > 0 then "" else empty end), format_2lock(.value))
      else empty end),
-    (if ($cn | length) > 0 then
-        (if ($c2 | length) > 0 then "" else empty end),
-        ($cn | to_entries[] | (if .key > 0 then "" else empty end), format_cycle(.value; $graph))
+    (if ($cycle_conflicts | length) > 0 then
+        (if ($pair_conflicts | length) > 0 then "" else empty end),
+        ($cycle_conflicts | to_entries[] | (if .key > 0 then "" else empty end), format_cycle(.value; $graph))
      else empty end);
 
 # ── main ──────────────────────────────────────────────────────────────────────
@@ -711,20 +693,44 @@ def analyze_function($funcs; $fn):
 
 def collect_results($funcs):
     reduce ($funcs | keys[]) as $fn ({all_pairs: [], violations: []};
-        analyze_function($funcs; $fn) as $r |
-        .all_pairs += $r.pairs | .violations += $r.violations
+        analyze_function($funcs; $fn) as $result |
+        .all_pairs += $result.pairs | .violations += $result.violations
     );
 
+def format_level_violation($v):
+    "  \($v.fn)(): \($v.lock_a):\($v.line_a) → \($v.lock_b):\($v.line_b) (level \($v.level_a) → \($v.level_b))";
+
+def format_same_level($v):
+    "  \($v.fn)(): \($v.lock_a):\($v.line_a) → \($v.lock_b):\($v.line_b) (both level \($v.level))";
+
+def format_no_level($v):
+    "no level declared: \($v.lock) in \($v.fn)():\($v.line)";
+
+def group_key($v):
+    if $v.type == "none" then "none:\($v.lock)"
+    else "\($v.lock_a):\($v.lock_b)" end;
+
+def format_violation_group($key; $violations):
+    if $violations[0].type == "none" then
+        $violations[] | format_no_level(.)
+    else
+        "level violation: \($violations[0].lock_a) vs \($violations[0].lock_b)",
+        ($violations[] | if .type == "level" then format_level_violation(.) else format_same_level(.) end)
+    end;
+
 def output_level_mode:
-    if (.violations | length) > 0 then .violations | unique | join("\n")
-    else empty end;
+    if (.violations | length) == 0 then empty
+    else
+        .violations | unique | group_by(group_key(.)) |
+        to_entries[] | format_violation_group(.key; .value)
+    end;
 
 def output_inference_mode:
     (.all_pairs | unique) as $pairs |
     ($pairs | build_graph) as $graph |
-    ($graph | find_2lock_conflicts) as $c2 |
-    ($graph | find_all_cycles) as $cn |
-    format_results($pairs; $c2; $cn; $graph);
+    ($graph | find_2lock_conflicts) as $pair_conflicts |
+    ($graph | find_all_cycles) as $cycle_conflicts |
+    format_results($pairs; $pair_conflicts; $cycle_conflicts; $graph);
 
 extract_functions as $funcs |
 collect_results($funcs) |
@@ -751,6 +757,37 @@ merge_ast() {
     rm -f "$TMP"
 }
 
+# ── source annotation extraction ─────────────────────────────────────────────
+
+# Extract lock_level=N from end-of-line comments
+# Populates LEVELS array, enables LEVEL_MODE if any found
+extract_source_levels() {
+    local FILE ENTRY
+    for FILE in "${POSITIONAL[@]}"; do
+        file_exists "$FILE" || continue
+        while IFS= read -r ENTRY; do
+            got "$ENTRY" || continue
+            LEVELS+=("$ENTRY")
+            LEVEL_MODE=1
+        done < <(gawk '
+            /typedef\s+struct\s*\{/ { in_struct = 1; next }
+            /lock_level\s*=\s*[0-9]+/ {
+                match($0, /([a-zA-Z_][a-zA-Z0-9_]*)\s*;.*lock_level\s*=\s*([0-9]+)/, m)
+                if (in_struct)
+                    pending[m[1]] = m[2]
+                else
+                    print m[2] ":" m[1]
+            }
+            /}\s*([A-Z][a-zA-Z0-9_]*)\s*;/ {
+                match($0, /}\s*([A-Z][a-zA-Z0-9_]*)\s*;/, m)
+                for (n in pending) print pending[n] ":" m[1] "." n
+                delete pending
+                in_struct = 0
+            }
+        ' "$FILE")
+    done
+}
+
 # ── main ──────────────────────────────────────────────────────────────────────
 
 main() {
@@ -758,9 +795,14 @@ main() {
 
     has_files || { usage >&2; exit 1; }
 
+    # Auto-extract lock levels from source comments
+    extract_source_levels
+
     local CONFIG
     local AST_FILE
     local JQ_FILE
+    local TMP_AST
+    local FILE_ERRORS=0
 
     CONFIG=$(build_config)
     AST_FILE=$(mktemp)
@@ -770,31 +812,27 @@ main() {
     echo '{"inner":[]}' > "$AST_FILE"
     write_jq_program > "$JQ_FILE"
 
-    local FILE_ERRORS=0
-
     for FILE in "${POSITIONAL[@]}"; do
         file_exists "$FILE" || { warn "not found: $FILE"; FILE_ERRORS=$((FILE_ERRORS + 1)); continue; }
 
-        local TMP_AST
         TMP_AST=$(mktemp)
-
-        if ! clang_ast "$FILE" > "$TMP_AST"; then
+        clang_ast "$FILE" > "$TMP_AST" || {
             warn "parse failed: $FILE"
             rm -f "$TMP_AST"
             FILE_ERRORS=$((FILE_ERRORS + 1))
             continue
-        fi
+        }
 
         merge_ast "$TMP_AST"
     done
 
     local OUTPUT
     local JQ_EXIT
-    
+
     OUTPUT=$(jq -r --argjson config "$CONFIG" -f "$JQ_FILE" "$AST_FILE") && JQ_EXIT=0 || JQ_EXIT=$?
-    
+
     if jq_failed; then die "analysis failed (jq exit $JQ_EXIT)"; fi
-    
+
     if got "$OUTPUT"; then
         echo "$OUTPUT"
         exit 1

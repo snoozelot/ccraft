@@ -1,33 +1,36 @@
 // cdeadl-levels.c — example for cdeadl level mode
 //
-// Same code as cdeadl.c, but demonstrates level-based verification.
-// Assign levels: Config.mu=1 (acquired first), Account.mu=2 (acquired second).
-// withdraw() violates this order.
+// Level-based deadlock prevention: assign each lock a level, acquire in
+// ascending order only. Violations detected at analysis time.
 //
-// Run: cdeadl --level 1 Config.mu --level 2 Account.mu examples/cdeadl-levels.c
-// Expected: level violation in withdraw(): Config.mu (level 1, line 43) acquired after Account.mu (level 2, line 42)
+// Levels declared via source comments (preferred) or CLI flags.
+//
+// Run: cdeadl examples/cdeadl-levels.c
+// Expected:
+//   level violation: Account.mu vs Config.mu
+//     withdraw(): Account.mu:N → Config.mu:M (level 2 → 1)
 
 #include <pthread.h>
 
-struct Config {
-    pthread_mutex_t mu;
+typedef struct {
+    pthread_mutex_t mu;  // lock_level=1
     int rate;
-};
+} Config;
 
-struct Account {
-    pthread_mutex_t mu;
+typedef struct {
+    pthread_mutex_t mu;  // lock_level=2
     int balance;
-};
+} Account;
 
-struct Config g_config;
-struct Account g_account;
+Config g_config;
+Account g_account;
 
-// Correct order: Config (level 1) before Account (level 2)
+// Correct order: level 1 before level 2
 void
-deposit(struct Config *cfg, struct Account *acc, int amount)
+deposit(Config *cfg, Account *acc, int amount)
 {
-    pthread_mutex_lock(&cfg->mu);
-    pthread_mutex_lock(&acc->mu);
+    pthread_mutex_lock(&cfg->mu);   // level 1
+    pthread_mutex_lock(&acc->mu);   // level 2 — OK, ascending
 
     acc->balance += amount * cfg->rate;
 
@@ -35,12 +38,12 @@ deposit(struct Config *cfg, struct Account *acc, int amount)
     pthread_mutex_unlock(&cfg->mu);
 }
 
-// Wrong order: level 2 before level 1 (should be ascending)
+// Wrong order: level 2 before level 1
 void
-withdraw(struct Account *acc, struct Config *cfg, int amount)
+withdraw(Account *acc, Config *cfg, int amount)
 {
-    pthread_mutex_lock(&acc->mu);   // level 2 — acquired first
-    pthread_mutex_lock(&cfg->mu);   // level 1 — violation! lower level after higher
+    pthread_mutex_lock(&acc->mu);   // level 2
+    pthread_mutex_lock(&cfg->mu);   // level 1 — violation! must be ascending
 
     acc->balance -= amount * cfg->rate;
 

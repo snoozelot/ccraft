@@ -9,9 +9,11 @@
 // Run: cdeadl examples/cdeadl.c
 // Expected output:
 //   deadlock: Account.mu vs Config.mu
-//   deadlock: Account.mu vs Wallet.mu
-//   deadlock: Data.mu vs Meta.mu
+//     withdraw(): Account.mu:N → Config.mu:M
+//     reload(): Config.mu:N → Account.mu:M
 //   deadlock: Account.mu → Logger.mu → Config.mu → Account.mu
+//     transfer(): Account.mu:N → Logger.mu:M
+//     ...
 
 #include <pthread.h>
 
