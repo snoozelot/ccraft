@@ -18,7 +18,8 @@
 #   Tokenizes the declaration, then applies recursive-descent parsing:
 #   parse_specifiers reads the base type; parse_declarator handles prefix
 #   operators (pointers, cv-qualifiers, grouped sub-declarators);
-#   parse_postfix handles suffix operators (arrays, function parameters).
+#   parse_postfix handles suffix operators (arrays, function parameters) —
+#   in postfix position a '(' is always a parameter list, never a sub-declarator.
 #   parse_params recurses to handle function pointer parameters.
 #
 # USAGE
@@ -75,7 +76,6 @@ function is_identifier(t)  { return t ~ /^[a-zA-Z_][a-zA-Z0-9_]*$/ }
 function is_pointer(t)     { return t == "*" }
 function is_empty(n)       { return n == 0 }
 function is_skip(line)     { return line ~ /^[[:space:]]*(#|$)/ }
-function starts_params()   { return tokens[pos + 1] != "*" }
 
 # ── tokenizer ─────────────────────────────────────────────────────────────────
 
@@ -87,6 +87,7 @@ function tokenize(s,    n) {
     gsub(/\]/, " ] ", s)
     gsub(/\*/, " * ", s)
     gsub(/,/,  " , ", s)
+    gsub(/;/,  " ; ", s)
     gsub(/[[:space:]]+/, " ", s)
     gsub(/^[[:space:]]+|[[:space:]]+$/, "", s)
 
@@ -165,7 +166,7 @@ function parse_postfix(    result, t, params) {
 
         if (t == "[") {
             result = result parse_array_suffix()
-        } else if (t == "(" && starts_params()) {
+        } else if (t == "(") {
             pos++
             params = parse_params()
             result = result "function (" params ") returning "
@@ -190,6 +191,11 @@ function parse_params(    result, pbase, pdecl) {
         if (tokens[pos] == ",") {
             pos++
             result = result ", "
+            continue
+        }
+        if (tokens[pos] == "...") {
+            result = result "..."
+            pos++
             continue
         }
 
