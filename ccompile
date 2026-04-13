@@ -1,72 +1,121 @@
 #!/bin/sh
-# ccompile - compile C files, chronic-style output
+# ccompile — batch compile C files with chronic-style output
 #
-# Usage: ccompile [-d DIR] [-o FILE] [-v] FILE.c...
+# WHAT IT DOES
+# Compiles multiple C files, showing progress and suppressing output on
+# success. Failed compilations print full diagnostics. Per-file compiler
+# flags can be embedded on line 1 (shebang or comment).
 #
-# Options:
+# HOW IT WORKS
+# 1. Parse CLI options for output directory/file
+# 2. For each source file, extract flags from line 1 (shebang or comment)
+# 3. Compile via $CC, capturing stdout/stderr
+# 4. On success: silent. On failure: print diagnostics
+#
+# USAGE
+#   ccompile [-d DIR] [-o FILE] [-v] FILE.c...
+#
+# OPTIONS
 #   -d DIR   Output directory (default: same as source)
 #   -o FILE  Output filename (single file only)
 #   -v       Show full compiler command
 #
-# Per-file flags via comment in source:
-#   // ccompile [-p PKG]... [CCFLAGS]...
+# PER-FILE FLAGS
+#   #!/usr/bin/env -S ccraft -lm
+#   #!/usr/bin/env -S ccraft -p SDL2 -O2
+#   // ccompile -lm -DDEBUG
+#   /* ccompile -lm -DDEBUG */
 #
-# Examples:
-#   // ccompile -lm
-#   // ccompile -p openssl -p json-c
-#   // ccompile -DDEBUG -O0
+# EXAMPLES
+#   ccompile *.c                    # compile all, binaries next to sources
+#   ccompile -d bin *.c             # compile all into bin/
+#   ccompile -o myprog main.c       # single file, custom output name
+#   ccompile -v -d build src/*.c    # verbose, see full compiler commands
 #
-# Dependencies: gcc (or $CC), pkg-config (if -p used)
+# ENVIRONMENT
+#   CC        Compiler (default: cc)
+#   CFLAGS    Compiler flags (default: -O2 -Wall -Wextra)
+#   LDFLAGS   Linker flags (default: none)
+#   STD_FLAG  C standard (default: -std=gnu99)
+#
+# DEPENDENCIES
+#   cc, or $CC
+#   pkg-config, if -p used
 
 set -eu
 
-CC=${CC:-gcc}
+CC=${CC:-cc}
 CFLAGS=${CFLAGS:--O2 -Wall -Wextra}
 
 has_arguments() { [ $# -gt 0 ]; }
 is_single()     { [ $# -eq 1 ]; }
 is_verbose()    { [ -n "${VERBOSE:-}" ]; }
+failed()        { [ "${1:-0}" -ne 0 ]; }
 
 die()   { echo "ccompile: $*" >&2; exit 1; }
 usage() { die "Usage: ccompile [-d DIR] [-o FILE] [-v] FILE.c..."; }
 
 output_path() {
     SRC=$1 OUTDIR=$2 OUTFILE=$3
-    if [ -n "$OUTFILE" ]; then echo "$OUTFILE"
-    elif [ -n "$OUTDIR" ]; then echo "$OUTDIR/$(basename "${SRC%.c}")"
-    else echo "${SRC%.c}"; fi
+    if [ -n "$OUTFILE" ]; then echo "$OUTFILE"; return; fi
+    if [ -n "$OUTDIR" ]; then echo "$OUTDIR/$(basename "${SRC%.c}")"; return; fi
+    echo "${SRC%.c}"
 }
 
+# Sets CFLAGS_SHEBANG (before source) and LDFLAGS_SHEBANG (after source) from shebang line.
+# Only -o is skipped — ccompile controls output path.
 parse_flags() {
-    LINE=$(grep -m1 '^// ccompile ' "$1" 2>/dev/null) || { echo ""; return 0; }
-    set -- ${LINE#// ccompile }
-    FLAGS=
+    CFLAGS_SHEBANG= LDFLAGS_SHEBANG= STD_FLAG=${STD_FLAG:--std=gnu99}
+    LINE=$(head -1 "$1")
+    case $LINE in
+        '#!'*ccraft*  ) expand_flags ${LINE#*ccraft}   ;;
+        '//'*ccompile*) expand_flags ${LINE#*ccompile} ;;
+        '/*'*ccompile*) LINE=${LINE%\*/};
+                        expand_flags ${LINE#*ccompile} ;;
+    esac
+}
+
+expand_flags() {
     while [ $# -gt 0 ]; do
         case $1 in
-            -p) FLAGS="$FLAGS $(pkg-config --cflags --libs "$2" 2>/dev/null)" || die "pkg-config: $2"; shift 2 ;;
-            *) FLAGS="$FLAGS $1"; shift ;;
+            -p)  CFLAGS_SHEBANG="$CFLAGS_SHEBANG $(pkg-config --cflags "$2" 2>/dev/null)" || die "pkg-config: $2"
+                 LDFLAGS_SHEBANG="$LDFLAGS_SHEBANG $(pkg-config --libs   "$2" 2>/dev/null)" || die "pkg-config: $2"
+                 shift 2 ;;
+            -p*) CFLAGS_SHEBANG="$CFLAGS_SHEBANG $(pkg-config --cflags "${1#-p}" 2>/dev/null)" || die "pkg-config: ${1#-p}"
+                 LDFLAGS_SHEBANG="$LDFLAGS_SHEBANG $(pkg-config --libs   "${1#-p}" 2>/dev/null)" || die "pkg-config: ${1#-p}"
+                 shift ;;
+            -std=*) STD_FLAG=$1; shift ;;
+            -v|-vv) shift ;;   # ccraft verbosity, not a compiler flag
+            -o)  shift 2 ;;    # ccompile controls output path
+            -o*) shift ;;      # ccompile controls output path
+            -l*) LDFLAGS_SHEBANG="$LDFLAGS_SHEBANG $1"; shift ;;   # libs must follow source
+            *)   CFLAGS_SHEBANG="$CFLAGS_SHEBANG $1"; shift ;;
         esac
     done
-    echo "$FLAGS"
+}
+
+report_failure() {
+    echo "=== FAILED: $SRC ===" >&2
+    cat "$TMPDIR/out"
+    cat "$TMPDIR/err" >&2
 }
 
 compile() {
     SRC=$1 OUT=$2
-    TOUT="$CCOMPILE_TMP/out"
-    TERR="$CCOMPILE_TMP/err"
-    FLAGS=$(parse_flags "$SRC")
+    parse_flags "$SRC"
     RC=0
 
-    if is_verbose; then echo "$CC $CFLAGS $FLAGS -o $OUT $SRC ${LDFLAGS:-}" >&2; fi
+    SRCDIR=$(dirname "$(readlink -f "$SRC" 2>/dev/null || echo "$SRC")")
 
-    $CC $CFLAGS $FLAGS -o "$OUT" "$SRC" ${LDFLAGS:-} >"$TOUT" 2>"$TERR" || RC=$?
+    CC_ALL="$STD_FLAG -I$SRCDIR $CFLAGS $CFLAGS_SHEBANG"
+    LD_ALL="$LDFLAGS_SHEBANG ${LDFLAGS:-}"
 
-    if [ $RC -ne 0 ]; then
-        echo "=== FAILED: $SRC ===" >&2
-        cat "$TOUT"
-        cat "$TERR" >&2
-    fi
+    if is_verbose; then echo "$CC $CC_ALL -o $OUT $SRC $LD_ALL" >&2; fi
 
+    sed "1 s|^#!.*|#line 2 \"$SRC\"|" "$SRC" > "$TMPDIR/src.c"
+    $CC $CC_ALL -o "$OUT" "$TMPDIR/src.c" $LD_ALL >"$TMPDIR/out" 2>"$TMPDIR/err" || RC=$?
+
+    if failed "$RC"; then report_failure; fi
     return $RC
 }
 
@@ -100,9 +149,8 @@ main() {
     has_arguments "$@" || usage
     [ -z "$OUTFILE" ] || is_single "$@" || die "-o invalid with multiple files"
 
-    # Create a temporary directory for output/error logs
-    CCOMPILE_TMP=$(mktemp -d)
-    trap 'rm -rf "$CCOMPILE_TMP"' EXIT INT TERM HUP
+    TMPDIR=$(mktemp -d)
+    trap 'rm -rf "$TMPDIR"' EXIT INT TERM HUP
 
     compile_all "$OUTDIR" "$OUTFILE" "$@"
 }
