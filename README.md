@@ -84,11 +84,16 @@ $ clint script.c
 
 ## cproto
 
-Extract function prototypes from C source using clang AST.
+Extract function prototypes and type definitions from C source using clang AST.
+Generate complete header files with guards, forward declarations, and dependency-sorted types.
 
 ```sh
-$ cproto src/parser.c
+$ cproto src/parser.c                   # function prototypes only
+$ cproto -T src/parser.c                # include structs/enums/typedefs
+$ cproto -TgfS src/parser.c > parser.h  # full header with guards
 ```
+
+Options: `-s` static functions, `-T` types, `-g` guards, `-f` forward decls, `-S` sort by deps.
 
 ## cdecl
 

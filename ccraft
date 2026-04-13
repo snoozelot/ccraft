@@ -1,14 +1,51 @@
 #!/usr/bin/env bash
+# ccraft — just-in-time C compiler with shebang support
 #
-# RATIONALE
-# Just-in-time compilation for C code, making it essentially a scripting language.
-# Including header-only libraries that don't require linking is encouraged.
-# Works as a shebang interpreter, allowing C files to be executed directly.
+# WHAT IT DOES
+# Compiles and executes C source files on the fly. Works as a shebang
+# interpreter, so C files can be run directly like scripts. Caches compiled
+# binaries to avoid recompilation on subsequent runs.
 #
-# Supports three caching strategies via CCRAFT_CACHE environment variable:
-#   mtime (default) - Recompile when source is newer than binary (fastest)
-#   md5             - Recompile when content hash changes (most correct)
-#   none            - Always recompile (slowest, always fresh)
+# WHY
+# C has no REPL. Header-only libraries make single-file programs viable, but
+# the compile-run cycle adds friction. ccraft removes that friction: write C,
+# run it, iterate. The shebang support means ./hello.c just works.
+#
+# HOW IT WORKS
+# 1. Parse flags (pass-through to compiler) and extract source file
+# 2. Compute cache key based on strategy (mtime, md5, or none)
+# 3. If binary missing or stale, compile with gcc/clang
+# 4. Execute the binary with remaining arguments
+#
+# USAGE
+#   ccraft [CC_FLAG]... FILE.c [ARG]...
+#   #!/usr/bin/env ccraft  (as shebang)
+#
+# OPTIONS
+#   -v          Show compilation command
+#   -vv         Show compilation command and source code
+#   -std=STD    Override gnu99 as C standard
+#   -o FILE     Create persistent binary instead of cached one
+#   -p MODULE   Link against pkg-config module
+#   -l LIB      Link library
+#   ...         Any other CC/LD flags
+#
+# ENVIRONMENT
+#   CC             Compiler (default: cc)
+#   CCRAFT_CACHE   Cache strategy:
+#     mtime (default) - Recompile when source is newer than binary (fastest)
+#     md5             - Recompile when content hash changes (most correct)
+#     none            - Always recompile (slowest, always fresh)
+#
+# EXAMPLES
+#   ccraft hello.c
+#   ccraft -lm calc.c "2 + 3"
+#   ccraft -p SDL2 game.c
+#   cat hello.c | ccraft /dev/stdin
+#
+# DEPENDENCIES
+#   cc, or $CC
+#   pkg-config, if -p used
 #
 # C99 Standard Headers, for reference:
 #include <assert.h>
@@ -118,11 +155,13 @@ while has_flag "$1"; do
         -std=*) STD_FLAG=$1;     shift   ;;
         -o)     OUT=$2;          shift 2 ;;
         -o*)    OUT=${1#-o};     shift   ;;
-        -p)     mapfile -t -O ${#CC_FLAGS_USER[@]} CC_FLAGS_USER < <(pkg-config --cflags "$2")
-                mapfile -t -O ${#LD_FLAGS_USER[@]} LD_FLAGS_USER < <(pkg-config --libs "$2")
+        -p)     read -ra _cflags < <(pkg-config --cflags "$2")
+                read -ra _libs   < <(pkg-config --libs   "$2")
+                CC_FLAGS_USER+=("${_cflags[@]}"); LD_FLAGS_USER+=("${_libs[@]}")
                                  shift 2 ;;
-        -p*)    mapfile -t -O ${#CC_FLAGS_USER[@]} CC_FLAGS_USER < <(pkg-config --cflags "${1#-p}")
-                mapfile -t -O ${#LD_FLAGS_USER[@]} LD_FLAGS_USER < <(pkg-config --libs "${1#-p}")
+        -p*)    read -ra _cflags < <(pkg-config --cflags "${1#-p}")
+                read -ra _libs   < <(pkg-config --libs   "${1#-p}")
+                CC_FLAGS_USER+=("${_cflags[@]}"); LD_FLAGS_USER+=("${_libs[@]}")
                                  shift   ;;
         -l*)    LD_FLAGS_USER+=("$1"); shift ;;
         *)      CC_FLAGS_USER+=("$1"); shift ;;
