@@ -59,9 +59,9 @@ Examples:
 EOF
 }
 
-has_args()      { [[ $# -gt 0 ]]; }
-is_help()       { [[ $1 == -h || $1 == --help ]]; }
-stdin_is_tty()  { [[ -t 0 ]]; }
+has_args()        { [[ $# -gt 0 ]]; }
+is_help()         { [[ $1 == -h || $1 == --help ]]; }
+has_stdin_input() { [[ ! -t 0 ]]; }
 
 readonly AWK='
 # ── predicates ────────────────────────────────────────────────────────────────
@@ -99,16 +99,10 @@ function tokenize(s,    n) {
 
 function parse_specifiers(    spec, t) {
     spec = ""
-    while (pos <= ntokens) {
-        t = tokens[pos]
-        if (!is_type_specifier(t)) { break }
-        if (is_tagged_type(t)) {
-            spec = spec t " " tokens[pos + 1] " "
-            pos += 2
-        } else {
-            spec = spec t " "
-            pos++
-        }
+    while (pos <= ntokens && is_type_specifier(tokens[pos])) {
+        t = tokens[pos++]
+        spec = spec t " "
+        if (is_tagged_type(t)) { spec = spec tokens[pos++] " " }
     }
     gsub(/[[:space:]]+$/, "", spec)
     return spec
@@ -116,104 +110,54 @@ function parse_specifiers(    spec, t) {
 
 function parse_declarator(    result, ptrs, quals, t) {
     ptrs = ""
-
     while (pos <= ntokens && is_pointer(tokens[pos])) {
         pos++
         quals = ""
-        while (is_qualifier(tokens[pos])) {
-            quals = quals tokens[pos] " "
-            pos++
-        }
+        while (is_qualifier(tokens[pos])) { quals = quals tokens[pos++] " " }
         ptrs = quals "pointer to " ptrs
     }
 
     t = tokens[pos]
+    if (t == "(")              { pos++; result = parse_declarator(); pos++ }
+    else if (is_identifier(t)) { result = t " is "; pos++ }
+    else                       { result = "" }
 
-    if (t == "(") {
-        pos++
-        result = parse_declarator()
-        pos++
-    } else if (is_identifier(t)) {
-        result = t " is "
-        pos++
-    } else {
-        result = ""
-    }
-
-    result = result parse_postfix()
-    result = result ptrs
-
-    return result
+    return result parse_postfix() ptrs
 }
 
-function parse_array_suffix(    result) {
-    pos++
-    if (tokens[pos] == "]") {
-        result = "array of "
-        pos++
-    } else {
-        result = "array " tokens[pos] " of "
-        pos += 2
-    }
-    return result
-}
-
-function parse_postfix(    result, t, params) {
+function parse_postfix(    result, t, size, params) {
     result = ""
-
     while (pos <= ntokens) {
         t = tokens[pos]
-
         if (t == "[") {
-            result = result parse_array_suffix()
+            pos++
+            if (tokens[pos] == "]") { result = result "array of "; pos++ }
+            else { size = tokens[pos]; pos += 2; result = result "array " size " of " }
         } else if (t == "(") {
-            pos++
-            params = parse_params()
+            pos++; params = parse_params(); pos++
             result = result "function (" params ") returning "
-            pos++
-        } else {
-            break
-        }
+        } else break
     }
-
     return result
-}
-
-function strip_param_name(s) {
-    sub(/^[a-zA-Z_][a-zA-Z0-9_]* is /, "", s)
-    return s
 }
 
 function parse_params(    result, pbase, pdecl) {
     result = ""
-
     while (pos <= ntokens && tokens[pos] != ")") {
-        if (tokens[pos] == ",") {
-            pos++
-            result = result ", "
-            continue
-        }
-        if (tokens[pos] == "...") {
-            result = result "..."
-            pos++
-            continue
-        }
-
+        if (tokens[pos] == ",")   { pos++; result = result ", "; continue }
+        if (tokens[pos] == "...") { pos++; result = result "..."; continue }
         pbase = parse_specifiers()
         pdecl = parse_declarator()
-
-        if (pdecl != "") {
-            result = result strip_param_name(pdecl) pbase
-        } else {
-            result = result pbase
-        }
+        sub(/^[a-zA-Z_][a-zA-Z0-9_]* is /, "", pdecl)
+        result = result pdecl pbase
     }
-
-    if (result == "") { result = "void" }
-    return result
+    return (result == "") ? "void" : result
 }
 
 # ── main ──────────────────────────────────────────────────────────────────────
+
+function no_base(b)   { return b == "" }
+function no_result(r) { return r == "" }
 
 function process(line,    base, result) {
     if (is_skip(line)) { print ""; return }
@@ -223,9 +167,11 @@ function process(line,    base, result) {
 
     pos = 1
     base = parse_specifiers()
-    result = parse_declarator()
+    if (no_base(base)) { print ""; return }
 
-    if (result == "") { print ""; return }
+    result = parse_declarator()
+    if (no_result(result)) { print ""; return }
+
     print result base
 }
 
@@ -233,15 +179,13 @@ function process(line,    base, result) {
 '
 
 main() {
+    if has_args "$@" && is_help "$1"; then usage; exit 0; fi
     if has_args "$@"; then
-        if is_help "$1"; then usage; exit 0; fi
         echo "$*" | awk "$AWK"
-    elif stdin_is_tty; then
-        usage >&2
-        exit 1
-    else
-        awk "$AWK"
+        return 0
     fi
+    has_stdin_input || { usage >&2; exit 1; }
+    awk "$AWK"
 }
 
 main "$@"
