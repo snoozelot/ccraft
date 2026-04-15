@@ -210,13 +210,22 @@ extract_referenced_types() {
     local AST_FILE=$1
 
     jq -r '
-        def find_pointer_types:
-            .. | objects | select(.kind == "PointerType") | .inner[]? | select(.kind == "RecordType") | .decl.name // empty;
+        def extract_pointer_types:
+            capture("(?<tag>struct|union) (?<name>[a-zA-Z_][a-zA-Z0-9_]*) \\*"; "g")
+            | "\(.tag) \(.name)";
 
-        .inner[]?
-        | select(.kind == "RecordDecl")
-        | select(.completeDefinition == true)
-        | find_pointer_types
+        # Struct/union fields
+        (.inner[]? | select(.kind == "RecordDecl") | select(.completeDefinition == true)
+         | .inner[]? | select(.kind == "FieldDecl") | .type.qualType // ""),
+
+        # Function parameters
+        (.inner[]? | select(.kind == "FunctionDecl")
+         | .inner[]? | select(.kind == "ParmVarDecl") | .type.qualType // ""),
+
+        # Function return types
+        (.inner[]? | select(.kind == "FunctionDecl") | .type.qualType // "")
+
+        | extract_pointer_types
     ' "$AST_FILE" | sort -u
 }
 
@@ -224,14 +233,14 @@ emit_forward_declarations() {
     local AST_FILE=$1
     local DEFINED
     local REFERENCED
-    local TYPE
+    local TAGGED_TYPE
 
     DEFINED=$(extract_defined_types "$AST_FILE")
     REFERENCED=$(extract_referenced_types "$AST_FILE")
 
-    while IFS= read -r TYPE; do
-        got "$TYPE" || continue
-        echo "$DEFINED" | grep -q "struct $TYPE" || echo "struct $TYPE;"
+    while IFS= read -r TAGGED_TYPE; do
+        got "$TAGGED_TYPE" || continue
+        echo "$DEFINED" | grep -qFx "$TAGGED_TYPE" || echo "$TAGGED_TYPE;"
     done <<< "$REFERENCED"
 }
 
