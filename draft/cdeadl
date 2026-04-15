@@ -133,7 +133,7 @@ is_option()           { [[ $1 == -* ]]; }
 is_source_file()      { [[ $1 == *.c || $1 == *.h ]]; }
 is_option_value()     { ! is_option "$1" && ! is_source_file "$1"; }
 more_option_values()  { has_arguments "$@" && is_option_value "$1"; }
-jq_failed()           { [[ $JQ_EXIT -ne 0 ]]; }
+jq_succeeded()        { [[ $JQ_EXIT -eq 0 ]]; }
 has_json_items()      { [[ $1 != '[]' ]]; }
 
 array_to_json()  { local -n A=$1; printf '%s\n' "${A[@]}" | jq -R . | jq -s .; }
@@ -518,20 +518,20 @@ def process_lock($fn; $lock; $ltype; $path; $line):
 def resolve_lock($ev; $subst):
     ($ev.type_key // "") | substitute($subst);
 
-def skip_lock($lock; $fn):
-    $lock == "" or ($lock | is_ignored) or ($fn | is_trylock);
+def should_track($lock; $fn):
+    $lock != "" and ($lock | is_ignored | not) and ($fn | is_trylock | not);
 
 def expand($funcs; $fn; $params; $args; $held; $expanding):
-    if $expanding[$fn] then {pairs: [], sequence: []}
-    elif ($funcs[$fn] | not) then {pairs: [], sequence: []}
+    if $expanding[$fn] then {pairs: [], sequence: [], held: $held}
+    elif ($funcs[$fn] | not) then {pairs: [], sequence: [], held: $held}
     else
         ($expanding | .[$fn] = true) as $exp2 |
         build_subst($params; $args) as $subst |
         reduce $funcs[$fn].events[] as $ev ({pairs: [], sequence: [], held: $held};
             if $ev | is_lock_event then
                 resolve_lock($ev; $subst) as $lock |
-                if skip_lock($lock; $ev.fn) then .
-                else process_lock($fn; $lock; lock_type($ev.fn); $ev.path; $ev.line) end
+                if should_track($lock; $ev.fn) then process_lock($fn; $lock; lock_type($ev.fn); $ev.path; $ev.line)
+                else . end
             elif $ev | is_unlock_event then
                 resolve_lock($ev; $subst) as $lock |
                 if $lock == "" then . else del(.held[$lock]) end
@@ -540,10 +540,10 @@ def expand($funcs; $fn; $params; $args; $held; $expanding):
                 else
                     (($ev.arg_type_keys // []) | map(substitute($subst))) as $new_args |
                     expand($funcs; $ev.fn; $funcs[$ev.fn].params; $new_args; .held; $exp2) as $sub |
-                    .pairs += $sub.pairs | .sequence += $sub.sequence
+                    .pairs += $sub.pairs | .sequence += $sub.sequence | .held = $sub.held
                 end
             else . end
-        ) | {pairs: .pairs, sequence: .sequence}
+        ) | {pairs: .pairs, sequence: .sequence, held: .held}
     end;
 
 # ── level verification ────────────────────────────────────────────────────────
@@ -557,13 +557,13 @@ def same_level_violation($fn; $prev; $curr; $level):
     {type: "same", lock_a: $prev.lock, lock_b: $curr.lock,
      fn: $fn, line_a: $prev.line, line_b: $curr.line, level: $level};
 
-def no_level_violation($fn; $item):
+def missing_level_violation($fn; $item):
     {type: "none", lock: $item.lock, fn: $fn, line: $item.line};
 
 def check_level($fn; $item):
     ($item.lock | get_level) as $level |
     if $level == null then
-        .violations += [no_level_violation($fn; $item)]
+        .violations += [missing_level_violation($fn; $item)]
     elif $level < .prev_level then
         .violations += [level_violation($fn; {lock: .prev_lock, line: .prev_line}; $item; .prev_level; $level)]
     elif $level == .prev_level and $item.lock != .prev_lock then
@@ -831,7 +831,7 @@ main() {
 
     OUTPUT=$(jq -r --argjson config "$CONFIG" -f "$JQ_FILE" "$AST_FILE") && JQ_EXIT=0 || JQ_EXIT=$?
 
-    if jq_failed; then die "analysis failed (jq exit $JQ_EXIT)"; fi
+    jq_succeeded || die "analysis failed (jq exit $JQ_EXIT)"
 
     if got "$OUTPUT"; then
         echo "$OUTPUT"
