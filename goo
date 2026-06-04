@@ -170,7 +170,7 @@ build_go() {
     # Script mode: only the entry file
     cp "$SRC" "$BUILD_DIR/main.go"
 
-    in_dir "$BUILD_DIR" quiet "${GO-go}" mod init tmp
+    in_dir "$BUILD_DIR" quiet "${GO-go}" mod init goo
     if has_deps; then
         in_dir "$BUILD_DIR" resolve_deps "$FILE_GO"
         in_dir "$BUILD_DIR" resolve_go_get
