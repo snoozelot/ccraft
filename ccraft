@@ -19,6 +19,7 @@
 #
 # USAGE
 #   ccraft [CC_FLAG]... FILE.c [ARG]...
+#   Everything after FILE.c is passed to the compiled binary.
 #   #!/usr/bin/env ccraft  (as shebang)
 #
 # OPTIONS
@@ -265,6 +266,10 @@ fi
 # Reset xtrace, re-enable if verbose
 { set +x; } 2>/dev/null
 wants_trace && set -x
+
+# Disable errexit
+# exec -a replaces the subshell process, so set -e loses the xtrace of the implicit exit when the binary returns non-zero.
+{ set +e; } 2>/dev/null
 
 # Execute the compiled binary with remaining arguments, overriding argv[0] to FILE_C
 # Use subshell to preserve cleanup trap
