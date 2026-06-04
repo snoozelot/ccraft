@@ -88,8 +88,26 @@ $ clint script.c
 Run Go files as scripts. No go run, no go.mod, no figuring out where to build.
 Caches the compiled binary — subsequent runs skip compilation entirely.
 
+```go
+#!/usr/bin/env -S goo
+// go get rsc.io/quote@v1.5.2
+
+package main
+
+import "rsc.io/quote"
+
+func main() {
+    println(quote.Hello())
+}
+```
+
 ```sh
-$ goo hello.go                # script mode, temp module
+$ chmod +x hello.go
+$ ./hello.go
+```
+
+```sh
+$ goo hello.go                # script mode, same effect
 $ goo .                       # project mode, finds go.mod
 $ goo . -- -flag arg          # pass args to the program
 $ goo -m main.go              # file as project entry point
@@ -97,7 +115,8 @@ $ cat script.go | goo /dev/stdin
 ```
 
 Script mode (`FILE.go`): creates a temp module, runs `go get` for `// go get`
-directives and `-p` specs, builds. No go.mod touched.
+directives and `-p` specs, builds. No go.mod touched. Shebang lines work the
+same as ccraft — mark the file executable and run directly.
 
 Project mode (`DIR` or `-m`): finds go.mod, runs `go mod tidy`, builds the package.
 

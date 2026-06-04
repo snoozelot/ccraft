@@ -43,6 +43,7 @@
 #   goo [FLAGS] [FILE.go|DIR] [ARG...]
 #   Everything after FILE.go|DIR is passed to the compiled binary.
 #   Use -- to separate: goo . -- -flag or goo -m main.go -- -flag.
+#   #!/usr/bin/env -S goo  (as shebang for .go files)
 #
 # EXAMPLES
 #   goo hello.go           # quick script, no go.mod needed

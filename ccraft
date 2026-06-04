@@ -20,7 +20,7 @@
 # USAGE
 #   ccraft [CC_FLAG]... FILE.c [ARG]...
 #   Everything after FILE.c is passed to the compiled binary.
-#   #!/usr/bin/env ccraft  (as shebang)
+#   #!/usr/bin/env -S ccraft  (as shebang; add flags after ccraft, e.g. -p libcurl)
 #
 # OPTIONS
 #   -v          Show compilation command
