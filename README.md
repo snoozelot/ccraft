@@ -7,6 +7,7 @@ C development tools.
 - [ccraft](#ccraft-1) — run C files as scripts
 - [ccompile](#ccompile) — batch compile, quiet on success
 - [clint](#clint) — lint C scripts
+- [goo](#goo) — run Go files as scripts
 - [cproto](#cproto) — extract function prototypes
 - [cdecl](#cdecl) — explain C declarations
 - [cflow](#cflow) — function call tree
@@ -80,6 +81,41 @@ Lint C scripts using gcc syntax-only mode.
 
 ```sh
 $ clint script.c
+```
+
+## goo
+
+Run Go files as scripts. No go run, no go.mod, no figuring out where to build.
+Caches the compiled binary — subsequent runs skip compilation entirely.
+
+```sh
+$ goo hello.go                # script mode, temp module
+$ goo .                       # project mode, finds go.mod
+$ goo . -- -flag arg          # pass args to the program
+$ goo -m main.go              # file as project entry point
+$ cat script.go | goo /dev/stdin
+```
+
+Script mode (`FILE.go`): creates a temp module, runs `go get` for `// go get`
+directives and `-p` specs, builds. No go.mod touched.
+
+Project mode (`DIR` or `-m`): finds go.mod, runs `go mod tidy`, builds the package.
+
+```
+$ goo -h
+Usage: goo [FLAGS] [FILE.go|DIR] [ARG...]
+
+Options:
+  -m           Project mode (use go.mod, build the package)
+  -v           Show build commands
+  -vv          Also show source code (script mode only)
+  -o FILE      Write binary to FILE instead of cache
+  -p PKG       Download package (e.g. -p rsc.io/quote@v1.5.2)
+  ...          Any go build flag (e.g. -tags, -ldflags)
+
+Environment:
+  GO            = go
+  GOO_CACHE     = mtime  (mtime|md5|none)
 ```
 
 ## cproto

@@ -1,0 +1,490 @@
+#!/usr/bin/env bash
+# goo — build and cache Go files, one command
+#
+# WHAT IT DOES
+# Runs a Go file or project with one command. No go build, no go run,
+# no figuring out where the entry point is. Caches the compiled binary
+# — subsequent runs skip compilation entirely.
+#
+# WHY
+# go run is stateless. A single-file script with external deps needs a
+# go.mod, manual go get, and loses shebang execution. goo handles all of
+# that: ONE file with // go get lines, run it directly or via shebang.
+# For projects, goo . finds the main() package automatically.
+# No more remembering ./cmd/web/ paths.
+#
+# HOW IT WORKS
+# Two modes decided by argument type:
+#   FILE.go       Script mode. Creates a temp module, runs go get for
+#                 // go get and -p specs, builds. No go.mod touched.
+#   DIR           Project mode. Finds go.mod in DIR or git root, runs
+#                 go mod tidy (every invocation), builds the package.
+#   -m FILE.go    Project mode override for files.
+#
+# Dependency resolution (script mode):
+#   go get is incremental — only downloads modules not in GOMODCACHE.
+#   Runs every rebuild, not on cache hits. -p specs are part of the
+#   scope_id (cache key), so adding or removing -p changes the key
+#   and triggers a fresh build. go mod tidy is NOT run in script mode
+#   — go get already writes go.mod and go.sum correctly.
+#
+# Cache:
+#   mtime: binary fresh if all .go files are older than binary.
+#   md5:   binary fresh if content hash (all files + -p specs) unchanged.
+#   none:  always rebuild.
+#   Cache key includes GO_GET_DEPS, so -p changes invalidate the cache.
+#
+# Temp files (script mode):
+#   Temp directories and cleaned sources are tracked in CLEANUP array.
+#   trap installed before build — failures don't leak files.
+#   find output is sorted for deterministic scope_id across runs.
+#
+# USAGE
+#   goo [FLAGS] [FILE.go|DIR] [ARG...]
+#   Everything after FILE.go|DIR is passed to the compiled binary.
+#   Use -- to separate: goo . -- -flag or goo -m main.go -- -flag.
+#
+# EXAMPLES
+#   goo hello.go           # quick script, no go.mod needed
+#   goo .                  # discover and run this project
+#   goo . -- -flag arg     # pass -flag arg to the program
+#   goo -m main.go         # build file as part of project
+#   goo -p rsc.io/quote hello.go  # download dep explicitly
+#   cat hello.go | goo /dev/stdin
+#
+# OPTIONS
+#   -m           Project mode (use go.mod, build the package)
+#   -v           Show build commands
+#   -vv          Also show source code (script mode only)
+#   -o FILE      Write binary to FILE instead of cache
+#   -p PKG       Download package (e.g. -p rsc.io/quote@v1.5.2)
+#   ...          Any go build flag (e.g. -tags, -ldflags)
+#
+# ENVIRONMENT
+#   GO           Go toolchain binary (default: go)
+#   GOO_CACHE    Cache strategy: mtime (default), md5, or none
+#
+set -e
+
+# ============================================================================
+# Helpers
+# ============================================================================
+
+SCRIPT=${0##*/}
+
+die()            { echo "${SCRIPT}: $*" >&2; exit 1; }
+has_flag()       { [[ ${1:-} == -* ]]; }
+has_binary()     { [[ -x $OUT ]]; }
+is_target_stdin()     { [[ $TARGET == "/dev/stdin" ]]; }
+is_target_directory() { [[ -d $TARGET ]]; }
+is_regular_file()     { [[ -f $1 ]]; }
+
+is_stdin()        { [[ $FILE_ARG == "/dev/stdin" ]]; }
+is_verbose()      { [[ $V_FLAG -ge 1 ]]; }
+is_very_verbose() { [[ $V_FLAG -ge 2 ]]; }
+is_project_mode() { [[ $PROJECT_MODE -eq 1 ]]; }
+is_at_root()      { [[ $PKG_DIR == "$MODROOT" ]]; }
+has_cleanup()     { [[ ${#CLEANUP[@]} -gt 0 ]]; }
+
+# Run a command under set -x if verbose.
+# The + prefix distinguishes trace lines from binary output.
+trace() {
+    if is_verbose; then
+        set -x; "$@"; { set +x; } 2>/dev/null
+    else
+        "$@"
+    fi
+}
+
+# ============================================================================
+# Usage
+# ============================================================================
+
+usage() { sed -n '2,/^[^#]/ { s/^# \?//p }' "$0"; exit 0; }
+
+# ============================================================================
+# Module helpers
+# ============================================================================
+
+# Hash of dependency specs (// go get + -p) for module cache key.
+has_deps() { grep -q '^// go get ' "$FILE_GO" 2>/dev/null || [[ ${#GO_GET_DEPS[@]} -gt 0 ]]; }
+
+# Run command silently. On failure, show command and full output.
+# Verbose mode (-v) delegates to trace and always shows output.
+quiet() {
+    if is_verbose; then
+        trace "$@"
+    else
+        local OUT
+        local STATUS
+        OUT=$("$@" 2>&1)
+        STATUS=$?
+        if [ "$STATUS" -ne 0 ]; then
+            echo "+ $*" >&2
+            echo "$OUT" >&2
+        fi
+        return "$STATUS"
+    fi
+}
+
+# Collect .go files from DIR into ALL_GO_FILES for cache tracking.
+collect_go_files() {
+    local DIR=$1
+    ALL_GO_FILES=()
+    while IFS= read -r -d '' f; do
+        ALL_GO_FILES+=("$f")
+    done < <(find "$DIR" -maxdepth 1 -name '*.go' -xtype f -print0 2>/dev/null | sort -z)
+    if [[ ${#ALL_GO_FILES[@]} -eq 0 ]]; then
+        die "no .go files in $DIR"
+    fi
+}
+
+# Collect all .go files under module root (recursive, no vendor).
+collect_go_files_recursive() {
+    local DIR=$1
+    ALL_GO_FILES=()
+    while IFS= read -r -d '' f; do
+        ALL_GO_FILES+=("$f")
+    done < <(find "$DIR" -name '*.go' -not -path '*/vendor/*' -xtype f -print0 2>/dev/null | sort -z)
+}
+
+set_cache_stem() {
+    if is_at_root; then
+        PKG_REL="."
+        FILE="proj-$(basename "$MODROOT")"
+        return
+    fi
+    PKG_REL="${PKG_DIR#"$MODROOT"/}"
+    FILE="proj-$(basename "$MODROOT")-$(echo "$PKG_REL" | tr '/' '-')"
+}
+
+# Build in script mode (ephemeral module, no go.mod).
+build_go() {
+    local SRC=$1
+    local BUILD_DIR
+
+    BUILD_DIR=$(mktemp -d /tmp/goo-mod-XXXXX)
+    CLEANUP+=("$BUILD_DIR")
+
+    # Script mode: only the entry file
+    cp "$SRC" "$BUILD_DIR/main.go"
+
+    in_dir "$BUILD_DIR" quiet "${GO-go}" mod init tmp
+    if has_deps; then
+        in_dir "$BUILD_DIR" resolve_deps "$FILE_GO"
+        in_dir "$BUILD_DIR" resolve_go_get
+    fi
+    in_dir "$BUILD_DIR" trace "${GO-go}" build -buildvcs=false "${GO_FLAGS_USER[@]}" -o "$OUT" .
+}
+
+# Find go.mod by walking up from DIR to git root or /.
+find_modroot() {
+    local DIR=$1
+    local TARGET_GIT_ROOT
+
+    TARGET_GIT_ROOT=$(git -C "$DIR" rev-parse --show-toplevel 2>/dev/null) || TARGET_GIT_ROOT=
+
+    while [[ $DIR != "/" ]]; do
+        if [[ -f $DIR/go.mod ]]; then
+            echo "$DIR"
+            return 0
+        fi
+        if [[ -n $TARGET_GIT_ROOT && $DIR == "$TARGET_GIT_ROOT" ]]; then
+            break
+        fi
+        DIR=$(dirname "$DIR")
+    done
+    return 1
+}
+
+build_project() {
+    local REL_PATH
+
+    if is_at_root; then
+        REL_PATH="."
+    else
+        REL_PATH="${PKG_DIR#"$MODROOT"/}"
+    fi
+
+    in_dir "$MODROOT" trace "${GO-go}" build -buildvcs=false "${GO_FLAGS_USER[@]}" -o "$OUT" "./$REL_PATH"
+}
+
+discover_entries() {
+    local MODROOT=$1
+    local ENTRIES
+    local COUNT
+
+    ENTRIES=$(in_dir "$MODROOT" "${GO-go}" list -buildvcs=false -f '{{if eq .Name "main"}}{{.Dir}}{{end}}' ./... 2>/dev/null)
+    if [[ -z $ENTRIES ]]; then
+        die "no main packages found in $(basename "$MODROOT")"
+    fi
+
+    COUNT=$(echo "$ENTRIES" | grep -c .)
+    if [[ $COUNT -eq 1 ]]; then
+        echo "$ENTRIES"
+        return 0
+    fi
+
+    echo "multiple entry points in $(basename "$MODROOT"):" >&2
+    while IFS= read -r dir; do
+        echo "  ${dir#"$MODROOT"/}" >&2
+    done <<< "$ENTRIES"
+    exit 1
+}
+
+# Resolve // go get directives from source file.
+# SIDEFF: network calls via go get
+resolve_deps() {
+    local SOURCE=$1
+    local LINE
+    local SPEC
+
+    while IFS= read -r LINE; do
+        SPEC=${LINE#// go get }
+        quiet "${GO-go}" get "$SPEC"
+    done < <(grep '^// go get ' "$SOURCE" || :)
+}
+
+# Resolve -p flag dependencies.
+# SIDEFF: network calls via go get
+resolve_go_get() {
+    local SPEC
+
+    for SPEC in "${GO_GET_DEPS[@]}"; do
+        quiet "${GO-go}" get "$SPEC"
+    done
+}
+
+# ============================================================================
+# Cache helpers
+# ============================================================================
+
+# Cache key varies by strategy.
+# md5 hashes content, mtime hashes paths, none uses random.
+scope_id() {
+    case $CACHE_MODE in
+        md5)
+            {
+                id -u
+                for f in "${ALL_GO_FILES[@]}"; do cat "$f"; done
+                for s in "${GO_GET_DEPS[@]}"; do echo "$s"; done
+            } | md5sum | head -c8
+            ;;
+        mtime)
+            {
+                id -u
+                for f in "${ALL_GO_FILES[@]}"; do echo "$f"; done
+                for s in "${GO_GET_DEPS[@]}"; do echo "$s"; done
+            } | md5sum | head -c8
+            ;;
+        none)
+            printf '%s' "$$-$RANDOM"
+            ;;
+    esac
+}
+
+# Decide whether a recompile is needed.
+needs_recompile() {
+    if ! has_binary; then
+        return 0
+    fi
+
+    case $CACHE_MODE in
+        none)  return 0 ;;
+        mtime)
+            for f in "${ALL_GO_FILES[@]}"; do
+                if [[ $f -nt $OUT ]]; then
+                    return 0
+                fi
+            done
+            return 1
+            ;;
+        md5)
+            return 1
+            ;;
+    esac
+}
+
+# ============================================================================
+# Source / Execution helpers
+# ============================================================================
+
+# Run a command in a directory. Uses () to scope the cd.
+in_dir() { local DIR=$1; shift; (cd "$DIR" && "$@"); }
+
+# Resolve target: stdin → script, dir → project, file → script or -m project
+resolve_target() {
+    PROJECT_MODE=0
+
+    if is_target_stdin; then
+        FILE_ARG=$TARGET
+        resolve_source
+        TARGET=
+        return
+    fi
+
+    if is_target_directory; then
+        TARGET_DIR=$(cd "$TARGET" && pwd) || die "cannot resolve $TARGET"
+        MODROOT=$(find_modroot "$TARGET_DIR") || die "no go.mod from $TARGET up to git root or /"
+        PROJECT_MODE=1
+        PKG_DIR=$TARGET_DIR
+        if is_at_root; then
+            PKG_DIR=$(discover_entries "$MODROOT")
+        fi
+        set_cache_stem
+        return
+    fi
+
+    is_regular_file "$TARGET" || die "$TARGET: not a file or directory"
+
+    if [[ $M_FLAG -eq 1 ]]; then
+        TARGET_DIR=$(dirname "$(readlink -f "$TARGET")") || die "cannot resolve $TARGET"
+        MODROOT=$(find_modroot "$TARGET_DIR") || die "no go.mod from $TARGET_DIR up to git root or /"
+        PKG_DIR=$TARGET_DIR
+        FILE=$(basename "$TARGET" .go)
+        set_cache_stem
+        PROJECT_MODE=1
+    else
+        FILE_ARG=$TARGET
+        resolve_source
+    fi
+}
+
+# Prepare cleaned source file with //line directive for shebang handling.
+# Prints the temp file path.
+prepare_cleaned_source() {
+    local CLEANED
+    CLEANED="${TMPDIR-/tmp}/goo-src-$$.go"
+    sed '1s|#!|//|' < "$FILE_GO" > "$CLEANED"
+
+    if is_very_verbose; then
+        bat --language=go --number --paging=never "$CLEANED" 1>&2 2>/dev/null ||
+        cat -n "$CLEANED" 1>&2
+    fi
+
+    echo "$CLEANED"
+}
+
+resolve_source() {
+    if is_stdin; then
+        FILE_GO=$(mktemp /tmp/goo-stdin-XXXXX.go)
+        cat > "$FILE_GO"
+        CLEANUP+=("$FILE_GO")
+        [[ -s $FILE_GO ]] || die "stdin is empty"
+        FILE="stdin"
+        ALL_GO_FILES=("$FILE_GO")
+        return
+    fi
+
+    FILE_GO=$(readlink -f "$FILE_ARG") || die "cannot resolve $FILE_ARG"
+    FILE=${FILE_GO##*/}
+    FILE=${FILE%.go}
+    collect_go_files "$(dirname "$FILE_GO")"
+}
+
+# ============================================================================
+# Main
+# ============================================================================
+
+FILE=
+FILE_ARG=
+FILE_GO=
+SRC_CLEAN=
+SCOPE_ID=
+CACHE_DIR=
+M_FLAG=0
+PROJECT_MODE=0
+PKG_DIR=
+PKG_REL=
+MODROOT=
+
+V_FLAG=0
+GO_FLAGS_USER=()
+GO_GET_DEPS=()
+OUT=""
+CLEANUP=()
+CACHE_MODE=${GOO_CACHE-mtime}
+
+while has_flag "$1"; do
+    case $1 in
+        --)         shift; break    ;;
+        -v)         ((V_FLAG+=1));   shift   ;;
+        -vv)        ((V_FLAG+=2));   shift   ;;
+        -m)         M_FLAG=1;        shift   ;;
+        -o)         OUT=$2;          shift 2 ;;
+        -o*)        OUT=${1#-o};     shift   ;;
+        -p)         GO_GET_DEPS+=("$2"); shift 2 ;;
+        -p*)        GO_GET_DEPS+=("${1#-p}"); shift   ;;
+        -h|--help)  usage                        ;;
+        *)          GO_FLAGS_USER+=("$1");          shift   ;;
+    esac
+done
+
+# Remaining args: TARGET [-- PROG_ARGS...]
+# If TARGET is --, the next arg is the real target (for shebangs)
+TARGET=${1:-}
+shift 2>/dev/null || :
+
+if [[ $TARGET == "--" ]]; then
+    TARGET=${1:-}
+    shift 2>/dev/null || :
+fi
+
+# Find -- separator; everything after goes to PROG_ARGS
+IDX=0
+for arg in "$@"; do
+    IDX=$((IDX + 1))
+    if [[ $arg == "--" ]]; then
+        while [[ $IDX -gt 0 ]]; do
+            shift
+            IDX=$((IDX - 1))
+        done
+        break
+    fi
+done
+
+if [[ -z $TARGET ]]; then
+    usage
+fi
+
+resolve_target
+
+if is_project_mode; then
+    collect_go_files_recursive "$MODROOT"
+    in_dir "$MODROOT" quiet "${GO-go}" mod tidy
+fi
+
+if has_cleanup; then
+    trap 'rm -rf -- "${CLEANUP[@]}"' EXIT
+fi
+
+CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/goo"
+mkdir -p "$CACHE_DIR"
+
+SCOPE_ID=$(scope_id)
+OUT=${OUT:-$CACHE_DIR/$FILE-$SCOPE_ID}
+
+if needs_recompile; then
+    if is_project_mode; then
+        build_project
+    else
+        SRC_CLEAN=$(prepare_cleaned_source)
+        CLEANUP+=("$SRC_CLEAN")
+        build_go "$SRC_CLEAN"
+    fi
+fi
+
+# Reset xtrace, re-enable if verbose
+{ set +x; } 2>/dev/null
+if is_verbose; then
+    set -x
+fi
+
+# Disable errexit
+{ set +e; } 2>/dev/null
+
+# Execute the compiled binary with remaining arguments, overriding argv[0] to the source file
+(exec -a "${FILE_ARG:-$TARGET}" "$OUT" "$@")
+
+# Explicit exit, for xtrace to log the actual exit status
+exit $?
