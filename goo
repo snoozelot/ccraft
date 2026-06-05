@@ -342,7 +342,7 @@ needs_recompile() {
 # ============================================================================
 
 # Run a command in a directory. Uses () to scope the cd.
-in_dir() { local DIR=$1; shift; (cd "$DIR" && "$@"); }
+in_dir() ( DIR=$1; shift; cd "$DIR" && "$@" )
 
 # Resolve target: stdin → script, dir → project, file → script or -m project
 resolve_target() {
