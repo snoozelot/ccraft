@@ -89,7 +89,7 @@ Run Go files as scripts. No go run, no go.mod, no figuring out where to build.
 Caches the compiled binary — subsequent runs skip compilation entirely.
 
 ```go
-#!/usr/bin/env -S goo
+#!/usr/bin/env -S goo -vv
 // go get rsc.io/quote@v1.5.2
 
 package main

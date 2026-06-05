@@ -41,14 +41,12 @@
 #
 # USAGE
 #   goo [FLAGS] [FILE.go|DIR] [ARG...]
-#   Everything after FILE.go|DIR is passed to the compiled binary.
-#   Use -- to separate: goo . -- -flag or goo -m main.go -- -flag.
+#   Everything after TARGET is passed to the compiled binary.
 #   #!/usr/bin/env -S goo  (as shebang for .go files)
 #
 # EXAMPLES
 #   goo hello.go           # quick script, no go.mod needed
 #   goo .                  # discover and run this project
-#   goo . -- -flag arg     # pass -flag arg to the program
 #   goo -m main.go         # build file as part of project
 #   goo -p rsc.io/quote hello.go  # download dep explicitly
 #   cat hello.go | goo /dev/stdin
@@ -74,6 +72,9 @@ set -e
 SCRIPT=${0##*/}
 
 die()            { echo "${SCRIPT}: $*" >&2; exit 1; }
+got()            { [[ -n $1 ]]; }
+no()             { [[ -z $1 ]]; }
+has_failed()     { [[ $1 -ne 0 ]]; }
 has_flag()       { [[ ${1:-} == -* ]]; }
 has_binary()     { [[ -x $OUT ]]; }
 is_target_stdin()     { [[ $TARGET == "/dev/stdin" ]]; }
@@ -86,6 +87,12 @@ is_very_verbose() { [[ $V_FLAG -ge 2 ]]; }
 is_project_mode() { [[ $PROJECT_MODE -eq 1 ]]; }
 is_at_root()      { [[ $PKG_DIR == "$MODROOT" ]]; }
 has_cleanup()     { [[ ${#CLEANUP[@]} -gt 0 ]]; }
+has_m_flag()      { [[ $M_FLAG -eq 1 ]]; }
+has_go_mod()      { [[ -f $1/go.mod ]]; }
+setup_cache_dir() {
+    CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/goo"
+    mkdir -p "$CACHE_DIR"
+}
 
 # Run a command under set -x if verbose.
 # The + prefix distinguishes trace lines from binary output.
@@ -120,23 +127,11 @@ quiet() {
         local STATUS
         OUT=$("$@" 2>&1)
         STATUS=$?
-        if [ "$STATUS" -ne 0 ]; then
+        if has_failed "$STATUS"; then
             echo "+ $*" >&2
             echo "$OUT" >&2
         fi
         return "$STATUS"
-    fi
-}
-
-# Collect .go files from DIR into ALL_GO_FILES for cache tracking.
-collect_go_files() {
-    local DIR=$1
-    ALL_GO_FILES=()
-    while IFS= read -r -d '' f; do
-        ALL_GO_FILES+=("$f")
-    done < <(find "$DIR" -maxdepth 1 -name '*.go' -xtype f -print0 2>/dev/null | sort -z)
-    if [[ ${#ALL_GO_FILES[@]} -eq 0 ]]; then
-        die "no .go files in $DIR"
     fi
 }
 
@@ -186,7 +181,7 @@ find_modroot() {
     TARGET_GIT_ROOT=$(git -C "$DIR" rev-parse --show-toplevel 2>/dev/null) || TARGET_GIT_ROOT=
 
     while [[ $DIR != "/" ]]; do
-        if [[ -f $DIR/go.mod ]]; then
+        if has_go_mod "$DIR"; then
             echo "$DIR"
             return 0
         fi
@@ -210,27 +205,60 @@ build_project() {
     in_dir "$MODROOT" trace "${GO-go}" build -buildvcs=false "${GO_FLAGS_USER[@]}" -o "$OUT" "./$REL_PATH"
 }
 
-discover_entries() {
+die_ambiguous_main() {
     local MODROOT=$1
-    local ENTRIES
-    local COUNT
+    local SCOPE=$2
+    local ENTRIES=$3
 
-    ENTRIES=$(in_dir "$MODROOT" "${GO-go}" list -buildvcs=false -f '{{if eq .Name "main"}}{{.Dir}}{{end}}' ./... 2>/dev/null)
-    if [[ -z $ENTRIES ]]; then
-        die "no main packages found in $(basename "$MODROOT")"
-    fi
-
-    COUNT=$(echo "$ENTRIES" | grep -c .)
-    if [[ $COUNT -eq 1 ]]; then
-        echo "$ENTRIES"
-        return 0
-    fi
-
-    echo "multiple entry points in $(basename "$MODROOT"):" >&2
+    echo "multiple entry points in $SCOPE:" >&2
     while IFS= read -r dir; do
         echo "  ${dir#"$MODROOT"/}" >&2
     done <<< "$ENTRIES"
     exit 1
+}
+
+single_entry_or_die() {
+    local MODROOT=$1
+    local SCOPE=$2
+    local ENTRIES=$3
+    local COUNT
+
+    COUNT=$(echo "$ENTRIES" | grep -c .)
+    if [[ $COUNT -eq 1 ]]; then
+        echo "$ENTRIES"
+        return
+    fi
+    die_ambiguous_main "$MODROOT" "$SCOPE" "$ENTRIES"
+}
+
+discover_entries() {
+    local MODROOT=$1
+    local ENTRIES
+
+    ENTRIES=$(in_dir "$MODROOT" "${GO-go}" list -buildvcs=false -f '{{if eq .Name "main"}}{{.Dir}}{{end}}' ./... 2>/dev/null)
+    got "$ENTRIES" || die "no main packages in $(basename "$MODROOT")"
+    single_entry_or_die "$MODROOT" "$(basename "$MODROOT")" "$ENTRIES"
+}
+
+# Find a single main package under a subdirectory within a module.
+# First checks if DIR itself is a main package (exact match).
+# If not, searches subdirectories — errors if zero or multiple found.
+discover_subdir_entries() {
+    local MODROOT=$1
+    local DIR=$2
+    local REL
+    local ENTRIES
+
+    REL="${DIR#"$MODROOT"/}"
+
+    if in_dir "$MODROOT" "${GO-go}" list -buildvcs=false -f '{{.Name}}' "./$REL" 2>/dev/null | grep -q '^main$'; then
+        echo "$DIR"
+        return
+    fi
+
+    ENTRIES=$(in_dir "$MODROOT" "${GO-go}" list -buildvcs=false -f '{{if eq .Name "main"}}{{.Dir}}{{end}}' "./$REL/..." 2>/dev/null)
+    got "$ENTRIES" || die "no main packages in $REL"
+    single_entry_or_die "$MODROOT" "$REL" "$ENTRIES"
 }
 
 # Resolve // go get directives from source file.
@@ -331,6 +359,8 @@ resolve_target() {
         PKG_DIR=$TARGET_DIR
         if is_at_root; then
             PKG_DIR=$(discover_entries "$MODROOT")
+        else
+            PKG_DIR=$(discover_subdir_entries "$MODROOT" "$PKG_DIR")
         fi
         set_cache_stem
         return
@@ -338,7 +368,7 @@ resolve_target() {
 
     is_regular_file "$TARGET" || die "$TARGET: not a file or directory"
 
-    if [[ $M_FLAG -eq 1 ]]; then
+    if has_m_flag; then
         TARGET_DIR=$(dirname "$(readlink -f "$TARGET")") || die "cannot resolve $TARGET"
         MODROOT=$(find_modroot "$TARGET_DIR") || die "no go.mod from $TARGET_DIR up to git root or /"
         PKG_DIR=$TARGET_DIR
@@ -380,7 +410,7 @@ resolve_source() {
     FILE_GO=$(readlink -f "$FILE_ARG") || die "cannot resolve $FILE_ARG"
     FILE=${FILE_GO##*/}
     FILE=${FILE%.go}
-    collect_go_files "$(dirname "$FILE_GO")"
+    ALL_GO_FILES=("$FILE_GO")
 }
 
 # ============================================================================
@@ -408,7 +438,6 @@ CACHE_MODE=${GOO_CACHE-mtime}
 
 while has_flag "$1"; do
     case $1 in
-        --)         shift; break    ;;
         -v)         ((V_FLAG+=1));   shift   ;;
         -vv)        ((V_FLAG+=2));   shift   ;;
         -m)         M_FLAG=1;        shift   ;;
@@ -421,32 +450,10 @@ while has_flag "$1"; do
     esac
 done
 
-# Remaining args: TARGET [-- PROG_ARGS...]
-# If TARGET is --, the next arg is the real target (for shebangs)
 TARGET=${1:-}
 shift 2>/dev/null || :
 
-if [[ $TARGET == "--" ]]; then
-    TARGET=${1:-}
-    shift 2>/dev/null || :
-fi
-
-# Find -- separator; everything after goes to PROG_ARGS
-IDX=0
-for arg in "$@"; do
-    IDX=$((IDX + 1))
-    if [[ $arg == "--" ]]; then
-        while [[ $IDX -gt 0 ]]; do
-            shift
-            IDX=$((IDX - 1))
-        done
-        break
-    fi
-done
-
-if [[ -z $TARGET ]]; then
-    usage
-fi
+got "$TARGET" || usage
 
 resolve_target
 
@@ -459,8 +466,7 @@ if has_cleanup; then
     trap 'rm -rf -- "${CLEANUP[@]}"' EXIT
 fi
 
-CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/goo"
-mkdir -p "$CACHE_DIR"
+setup_cache_dir
 
 SCOPE_ID=$(scope_id)
 OUT=${OUT:-$CACHE_DIR/$FILE-$SCOPE_ID}
