@@ -1,24 +1,31 @@
 #!/usr/bin/env bash
-# goo — build and cache Go files, one command
+# goo — run Go files as scripts, with caching and dep management
 #
 # WHAT IT DOES
-# Runs a Go file or project with one command. No go build, no go run,
-# no figuring out where the entry point is. Caches the compiled binary
-# — subsequent runs skip compilation entirely.
+# Go script runner with caching and automatic dependency resolution.
+# Script mode: single-file programs with inline // go get directives, no go.mod needed.
+#
+# Project mode: auto-discovers main() package and runs go mod tidy.
+# Both modes cache the binary — no recompilation unless source changes.
+# Shebang support for ./script.go.
+#
+# Built-in caching strategies (mtime/md5/none), incremental go get,
+# pass-through for go build flags, and remaining args forwarded to
+# the compiled binary.
 #
 # WHY
 # go run is stateless. A single-file script with external deps needs a
-# go.mod, manual go get, and loses shebang execution. goo handles all of
-# that: ONE file with // go get lines, run it directly or via shebang.
-# For projects, goo . finds the main() package automatically.
-# No more remembering ./cmd/web/ paths.
+# go.mod, manual go get, and loses shebang execution. goo removes that
+# friction: one file with // go get lines, run it or shebang it.
+# For projects, goo . finds the main() package automatically — no
+# more remembering ./cmd/web/ paths.
 #
 # HOW IT WORKS
 # Two modes decided by argument type:
 #   FILE.go       Script mode. Creates a temp module, runs go get for
 #                 // go get and -p specs, builds. No go.mod touched.
 #   DIR           Project mode. Finds go.mod in DIR or git root, runs
-#                 go mod tidy (every invocation), builds the package.
+#                 go mod tidy (on rebuild), builds the package.
 #   -m FILE.go    Project mode override for files.
 #
 # Dependency resolution (script mode):
@@ -29,20 +36,15 @@
 #   — go get already writes go.mod and go.sum correctly.
 #
 # Cache:
-#   mtime: binary fresh if all .go files are older than binary.
-#   md5:   binary fresh if content hash (all files + -p specs) unchanged.
+#   Binaries in /tmp/goo-HASH.bin, module dirs in /tmp/goo-HASH/ (cleaned).
+#   Cache key includes GO_GET_DEPS, so -p changes invalidate.
+#   mtime: rebuild when .go files are newer than .bin.
+#   md5:   rebuild when content hash changes (path changes per version).
 #   none:  always rebuild.
-#   Cache key includes GO_GET_DEPS, so -p changes invalidate the cache.
-#
-# Temp files (script mode):
-#   Temp directories and cleaned sources are tracked in CLEANUP array.
-#   trap installed before build — failures don't leak files.
-#   find output is sorted for deterministic scope_id across runs.
 #
 # USAGE
 #   goo [FLAGS] [FILE.go|DIR] [ARG...]
 #   Everything after TARGET is passed to the compiled binary.
-#   #!/usr/bin/env -S goo  (as shebang for .go files)
 #
 # EXAMPLES
 #   goo hello.go           # quick script, no go.mod needed
@@ -51,17 +53,29 @@
 #   goo -p rsc.io/quote hello.go  # download dep explicitly
 #   cat hello.go | goo /dev/stdin
 #
+#   #!/usr/bin/env -S goo
+#   // go get rsc.io/quote@v1.5.2
+#   package main
+#   import "rsc.io/quote"
+#   func main() { println(quote.Hello()) }
+#
+#   #!/usr/bin/env -S goo -p rsc.io/quote@v1.5.2
+#   package main
+#   import "rsc.io/quote"
+#   func main() { println(quote.Hello()) }
+#
 # OPTIONS
 #   -m           Project mode (use go.mod, build the package)
 #   -v           Show build commands
 #   -vv          Also show source code (script mode only)
-#   -o FILE      Write binary to FILE instead of cache
+#   -o FILE      Write binary to FILE instead of /tmp/ cache
 #   -p PKG       Download package (e.g. -p rsc.io/quote@v1.5.2)
 #   ...          Any go build flag (e.g. -tags, -ldflags)
 #
 # ENVIRONMENT
 #   GO           Go toolchain binary (default: go)
 #   GOO_CACHE    Cache strategy: mtime (default), md5, or none
+#   TMPDIR       Temp directory (default: /tmp)
 #
 set -e
 
@@ -89,10 +103,6 @@ is_at_root()      { [[ $PKG_DIR == "$MODROOT" ]]; }
 has_cleanup()     { [[ ${#CLEANUP[@]} -gt 0 ]]; }
 has_m_flag()      { [[ $M_FLAG -eq 1 ]]; }
 has_go_mod()      { [[ -f $1/go.mod ]]; }
-setup_cache_dir() {
-    CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/goo"
-    mkdir -p "$CACHE_DIR"
-}
 
 # Run a command under set -x if verbose.
 # The + prefix distinguishes trace lines from binary output.
@@ -123,13 +133,13 @@ quiet() {
     if is_verbose; then
         trace "$@"
     else
-        local OUT
+        local CAPTURED
         local STATUS
-        OUT=$("$@" 2>&1)
+        CAPTURED=$("$@" 2>&1)
         STATUS=$?
         if has_failed "$STATUS"; then
             echo "+ $*" >&2
-            echo "$OUT" >&2
+            echo "$CAPTURED" >&2
         fi
         return "$STATUS"
     fi
@@ -142,16 +152,6 @@ collect_go_files_recursive() {
     while IFS= read -r -d '' f; do
         ALL_GO_FILES+=("$f")
     done < <(find "$DIR" -name '*.go' -not -path '*/vendor/*' -xtype f -print0 2>/dev/null | sort -z)
-}
-
-set_cache_stem() {
-    if is_at_root; then
-        PKG_REL="."
-        FILE="proj-$(basename "$MODROOT")"
-        return
-    fi
-    PKG_REL="${PKG_DIR#"$MODROOT"/}"
-    FILE="proj-$(basename "$MODROOT")-$(echo "$PKG_REL" | tr '/' '-')"
 }
 
 # Build in script mode (ephemeral module, no go.mod).
@@ -288,8 +288,7 @@ resolve_go_get() {
 # Cache helpers
 # ============================================================================
 
-# Cache key varies by strategy.
-# md5 hashes content, mtime hashes paths, none uses random.
+# Cache key from source identity (mtime/none path hash, md5 content hash).
 scope_id() {
     case $CACHE_MODE in
         md5)
@@ -307,7 +306,11 @@ scope_id() {
             } | md5sum | head -c8
             ;;
         none)
-            printf '%s' "$$-$RANDOM"
+            {
+                id -u
+                for f in "${ALL_GO_FILES[@]}"; do echo "$f"; done
+                for s in "${GO_GET_DEPS[@]}"; do echo "$s"; done
+            } | md5sum | head -c8
             ;;
     esac
 }
@@ -362,7 +365,6 @@ resolve_target() {
         else
             PKG_DIR=$(discover_subdir_entries "$MODROOT" "$PKG_DIR")
         fi
-        set_cache_stem
         return
     fi
 
@@ -372,8 +374,6 @@ resolve_target() {
         TARGET_DIR=$(dirname "$(readlink -f "$TARGET")") || die "cannot resolve $TARGET"
         MODROOT=$(find_modroot "$TARGET_DIR") || die "no go.mod from $TARGET_DIR up to git root or /"
         PKG_DIR=$TARGET_DIR
-        FILE=$(basename "$TARGET" .go)
-        set_cache_stem
         PROJECT_MODE=1
     else
         FILE_ARG=$TARGET
@@ -385,7 +385,7 @@ resolve_target() {
 # Prints the temp file path.
 prepare_cleaned_source() {
     local CLEANED
-    CLEANED="${TMPDIR-/tmp}/goo-src-$$.go"
+    CLEANED=$(mktemp /tmp/goo-XXXXX.go) || die "cannot create temp file"
     sed '1s|#!|//|' < "$FILE_GO" > "$CLEANED"
 
     if is_very_verbose; then
@@ -398,18 +398,15 @@ prepare_cleaned_source() {
 
 resolve_source() {
     if is_stdin; then
-        FILE_GO=$(mktemp /tmp/goo-stdin-XXXXX.go)
+        FILE_GO=$(mktemp /tmp/goo-XXXXX.go)
         cat > "$FILE_GO"
         CLEANUP+=("$FILE_GO")
         [[ -s $FILE_GO ]] || die "stdin is empty"
-        FILE="stdin"
         ALL_GO_FILES=("$FILE_GO")
         return
     fi
 
     FILE_GO=$(readlink -f "$FILE_ARG") || die "cannot resolve $FILE_ARG"
-    FILE=${FILE_GO##*/}
-    FILE=${FILE%.go}
     ALL_GO_FILES=("$FILE_GO")
 }
 
@@ -417,16 +414,13 @@ resolve_source() {
 # Main
 # ============================================================================
 
-FILE=
 FILE_ARG=
 FILE_GO=
 SRC_CLEAN=
 SCOPE_ID=
-CACHE_DIR=
 M_FLAG=0
 PROJECT_MODE=0
 PKG_DIR=
-PKG_REL=
 MODROOT=
 
 V_FLAG=0
@@ -459,20 +453,18 @@ resolve_target
 
 if is_project_mode; then
     collect_go_files_recursive "$MODROOT"
-    in_dir "$MODROOT" quiet "${GO-go}" mod tidy
 fi
 
 if has_cleanup; then
     trap 'rm -rf -- "${CLEANUP[@]}"' EXIT
 fi
 
-setup_cache_dir
-
 SCOPE_ID=$(scope_id)
-OUT=${OUT:-$CACHE_DIR/$FILE-$SCOPE_ID}
+OUT=${OUT:-${TMPDIR-/tmp}/goo-${SCOPE_ID}.bin}
 
 if needs_recompile; then
     if is_project_mode; then
+        in_dir "$MODROOT" quiet "${GO-go}" mod tidy
         build_project
     else
         SRC_CLEAN=$(prepare_cleaned_source)

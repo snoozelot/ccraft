@@ -1,21 +1,16 @@
 #!/usr/bin/env bash
-# ccraft — just-in-time C compiler with shebang support
+# ccraft — run C files as scripts, with caching and shebang support
 #
 # WHAT IT DOES
-# Compiles and executes C source files on the fly. Works as a shebang
-# interpreter, so C files can be run directly like scripts. Caches compiled
-# binaries to avoid recompilation on subsequent runs.
+# Compiles and executes C source files on the fly.
+# Works as a shebang interpreter, so C files can be run directly like scripts.
+# Caches compiled binaries in /tmp/ to avoid recompilation on subsequent runs,
+# silent on cache hit, rebuilds only when source changes.
 #
 # WHY
 # C has no REPL. Header-only libraries make single-file programs viable, but
 # the compile-run cycle adds friction. ccraft removes that friction: write C,
 # run it, iterate. The shebang support means ./hello.c just works.
-#
-# HOW IT WORKS
-# 1. Parse flags (pass-through to compiler) and extract source file
-# 2. Compute cache key based on strategy (mtime, md5, or none)
-# 3. If binary missing or stale, compile with gcc/clang
-# 4. Execute the binary with remaining arguments
 #
 # USAGE
 #   ccraft [CC_FLAG]... FILE.c [ARG]...
@@ -24,11 +19,11 @@
 #
 # OPTIONS
 #   -v          Show compilation command
-#   -vv         Show compilation command and source code
+#   -vv         Show compilation command and source code (rebuild only)
 #   -std=STD    Override gnu99 as C standard
-#   -o FILE     Create persistent binary instead of cached one
-#   -p MODULE   Link against pkg-config module
-#   -l LIB      Link library
+#   -o FILE     Write binary to FILE instead of /tmp/ cache
+#   -p MODULE   Link against pkg-config MODULE, e.g. -p freetype2
+#   -lLIB       Link library (compact form, e.g. -lm)
 #   ...         Any other CC/LD flags
 #
 # ENVIRONMENT
@@ -36,7 +31,8 @@
 #   CCRAFT_CACHE   Cache strategy:
 #     mtime (default) - Recompile when source is newer than binary (fastest)
 #     md5             - Recompile when content hash changes (most correct)
-#     none            - Always recompile (slowest, always fresh)
+#     none            - Always recompile (no cache)
+#   TMPDIR         Temp directory (default: /tmp)
 #
 # EXAMPLES
 #   ccraft hello.c
@@ -45,7 +41,7 @@
 #   cat hello.c | ccraft /dev/stdin
 #
 # DEPENDENCIES
-#   cc, or $CC
+#   cc (or $CC)
 #   pkg-config, if -p used
 #
 # C99 Standard Headers, for reference:
@@ -106,22 +102,25 @@ usage() {
     cat <<EOS
 Usage: ${SCRIPT} [CC_FLAG]... FILE_C [ARG]...
 
-Compile FILE_C and execute it with ARGs as arguments, using just-in-time compilation.
-Essentially, a wrapper around CC with shebang interpreter support.
-When FILE_C is /dev/stdin, then your current working directory will be added as compiler include path.
-When FILE_C is a regular file, then its directory will be added as compiler include path.
+Compile FILE_C and execute it with ARGs as arguments to the program.
+Caches binary in /tmp/ — silent on hit, rebuilds when source changes.
+Shebang: #!/usr/bin/env -S ${SCRIPT}
+When FILE_C is /dev/stdin, cwd is added as compiler include path.
+When FILE_C is a regular file, its directory is added as include path.
 
 CC_FLAGs:
   -v          Show compilation command
-  -vv         Show compilation command and source code
+  -vv         Show compilation command and source code (rebuild only)
   -std=STD    Override gnu99 as C standard with STD
-  -o FILE     Create persistent binary FILE instead of ephemeral one
+  -o FILE     Write binary to FILE instead of /tmp/ cache
   -p MODULE   Link against pkg-config MODULE, e.g. -p freetype2
-  ...         Any other flags supported by CC, like \${CFLAGS} or \${LDFLAGS}
+  -lLIB       Link library (compact form, e.g. -lm)
+  ...         Any other CC/LD flags
 
 Environment:
   CC            = ${CC-cc}
   CCRAFT_CACHE  = ${CCRAFT_CACHE-mtime}  (mtime|md5|none)
+  TMPDIR        = /tmp (override for temp files)
 
 Caching strategies:
   mtime   Recompile when source newer than binary (default, fastest)
@@ -150,7 +149,6 @@ CACHE_MODE=${CCRAFT_CACHE-mtime}
 
 while has_flag "$1"; do
     case $1 in
-        --)     shift; break    ;;
         -v)     ((V_FLAG+=1));   shift   ;;
         -vv)    ((V_FLAG+=2));   shift   ;;
         -std=*) STD_FLAG=$1;     shift   ;;
@@ -175,7 +173,7 @@ FILE_C=$1; shift
 # For stdin, save to temp file (avoid consuming multiple times),
 # but keep FILE="stdin" for deterministic cache paths
 if is_stdin; then
-    FILE_C="${TMPDIR-/tmp}/stdin-$$.c"
+    FILE_C="${TMPDIR-/tmp}/ccraft-$$.c"
     cat > "$FILE_C"
     CLEANUP+=("$FILE_C")
     [[ -s $FILE_C ]] || die "stdin is empty"
@@ -186,24 +184,19 @@ else
     FILE=${FILE%.[ct]}
 fi
 
-# Cache: scope_id varies by strategy (md5=content, mtime=path, none=random)
+# Cache key from source identity (mtime/none path hash, md5 content hash)
 scope_id() {
     case $CACHE_MODE in
-        md5)   { id -u;
-                 cat "$FILE_C";
-               } | md5sum | head -c8 ;;
-        mtime) { id -u;
-                 readlink -f "$FILE_C" 2>/dev/null || echo "$FILE_C";
-               } | md5sum | head -c8 ;;
-        none)  printf '%s' "$$-$RANDOM" ;;
+        md5)   { id -u; cat "$1"; } | md5sum | head -c8 ;;
+        mtime) { id -u; readlink -f "$1" 2>/dev/null || echo "$1"; } | md5sum | head -c8 ;;
+        none)  { id -u; readlink -f "$1" 2>/dev/null || echo "$1"; } | md5sum | head -c8 ;;
     esac
 }
 
-SCOPE_ID=$(scope_id)
-SCOPED_C="${TMPDIR-/tmp}/${FILE}-${SCOPE_ID}.c"
-SCOPED_OUT=${SCOPED_C%.c}
+SCOPE_ID=$(scope_id "$FILE_C")
+STEM="${TMPDIR-/tmp}/ccraft-${SCOPE_ID}"
 
-no "$OUT" && OUT=$SCOPED_OUT
+no "$OUT" && OUT="${STEM}.bin"
 
 needs_recompile() {
     case $CACHE_MODE in
@@ -222,17 +215,18 @@ include_dir() {
 }
 
 if needs_recompile; then
-    CLEANUP+=("$SCOPED_C")
+    SRC_CLEAN=$(mktemp /tmp/ccraft-XXXXX.c) || die "cannot create temp file"
+    CLEANUP+=("$SRC_CLEAN")
     trap 'rm -f -- "${CLEANUP[@]}"' EXIT
 
     # Replace shebang with #line pragma to:
     # - Avoid unknown pragma warnings (shebang is not valid C)
     # - Provide accurate line numbers in error messages
-    sed "1 s|^#!.*|#line 2 \"$FILE_C\"|" < "$FILE_C" > "$SCOPED_C"
+    sed "1 s|^#!.*|#line 2 \"$FILE_C\"|" < "$FILE_C" > "$SRC_CLEAN"
 
     if wants_source; then
-        bat --language=C --number --paging=never "$SCOPED_C"  1>&2 2>/dev/null ||
-        cat -vn "$SCOPED_C" 1>&2 2>/dev/null
+        bat --language=C --number --paging=never "$SRC_CLEAN"  1>&2 2>/dev/null ||
+        cat -vn "$SRC_CLEAN" 1>&2 2>/dev/null
     fi
 
     # Build complete compiler flags array
@@ -260,7 +254,7 @@ if needs_recompile; then
     wants_trace && set -x
 
     # LD_FLAGS after source for proper symbol resolution
-    "${CC-cc}" "${CC_FLAGS[@]}" -o"$OUT" "$SCOPED_C" "${LD_FLAGS_USER[@]}" >&2
+    "${CC-cc}" "${CC_FLAGS[@]}" -o"$OUT" "$SRC_CLEAN" "${LD_FLAGS_USER[@]}" >&2
 fi
 
 # Reset xtrace, re-enable if verbose

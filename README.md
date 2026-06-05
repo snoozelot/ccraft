@@ -20,7 +20,7 @@ C development tools.
 ## ccraft
 
 Run C files as scripts. No Makefile, no autoconf, no CMake, just add shebang and execute.
-Compiles on first run, caches the binary, recompiles when source changes.
+Compiles on first run, caches the binary in /tmp/, recompiles when source changes.
 
 ```c
 #!/usr/bin/env -S ccraft -p libcurl
@@ -46,17 +46,24 @@ $ ./fetch.c https://example.com
 $ ccraft -h
 Usage: ccraft [CC_FLAG]... FILE_C [ARG]...
 
+Compile FILE_C and execute it with ARGs as arguments to the program.
+Caches binary in /tmp/ — silent on hit, rebuilds when source changes.
+When FILE_C is /dev/stdin, cwd is added as include path.
+When FILE_C is a regular file, its directory is added as include path.
+
 CC_FLAGs:
   -v          Show compilation command
-  -vv         Show compilation command and source code
+  -vv         Show compilation command and source code (rebuild only)
   -std=STD    Override gnu99 as C standard with STD
-  -o FILE     Create persistent binary FILE instead of ephemeral one
+  -o FILE     Write binary to FILE instead of /tmp/ cache
   -p MODULE   Link against pkg-config MODULE, e.g. -p freetype2
-  ...         Any other flags supported by CC
+  -lLIB       Link library (compact form, e.g. -lm)
+  ...         Any other CC/LD flags
 
 Environment:
   CC            = cc
   CCRAFT_CACHE  = mtime  (mtime|md5|none)
+  TMPDIR        = /tmp (override for temp files)
 
 Caching:
   mtime   Recompile when source newer than binary (default)
@@ -69,10 +76,18 @@ The `hi-*.c` files are self-contained templates to embed in your project without
 ## ccompile
 
 Batch compile C files. Quiet on success (chronic-style), shows output only on failure. Binary goes next to source.
+Per-file compiler flags can be embedded on line 1 (shebang or comment).
 
 ```sh
 $ ccompile src/*.c              # src/foo.c → src/foo
 $ ccompile -d build src/*.c     # src/foo.c → build/foo
+$ ccompile -o server src/*.c    # single binary
+```
+
+```c
+// ccompile -lm -DDEBUG
+#include <math.h>
+int main() { return (int)sqrt(4) - 2; }
 ```
 
 ## clint
@@ -85,8 +100,9 @@ $ clint script.c
 
 ## goo
 
-Run Go files as scripts. No go run, no go.mod, no figuring out where to build.
-Caches the compiled binary — subsequent runs skip compilation entirely.
+Run Go files as scripts with caching and automatic dependency resolution.
+Script mode: single-file programs with inline // go get directives, no go.mod needed.
+Project mode: auto-discovers main() package. Both modes cache the binary.
 
 ```go
 #!/usr/bin/env -S goo -vv
@@ -109,16 +125,18 @@ $ ./hello.go
 ```sh
 $ goo hello.go                # script mode, same effect
 $ goo .                       # project mode, finds go.mod
-$ goo . -- -flag arg          # pass args to the program
+$ goo . -flag arg             # pass args to the program
 $ goo -m main.go              # file as project entry point
 $ cat script.go | goo /dev/stdin
 ```
 
 Script mode (`FILE.go`): creates a temp module, runs `go get` for `// go get`
-directives and `-p` specs, builds. No go.mod touched. Shebang lines work the
-same as ccraft — mark the file executable and run directly.
+directives and `-p` specs, builds. Binary in /tmp/goo-HASH.bin, module dir
+cleaned. No go.mod touched. Shebang lines work the same as ccraft — mark
+the file executable and run directly.
 
-Project mode (`DIR` or `-m`): finds go.mod, runs `go mod tidy`, builds the package.
+Project mode (`DIR` or `-m`): finds go.mod, runs `go mod tidy` (on rebuild),
+builds the package.
 
 ```
 $ goo -h
@@ -128,13 +146,14 @@ Options:
   -m           Project mode (use go.mod, build the package)
   -v           Show build commands
   -vv          Also show source code (script mode only)
-  -o FILE      Write binary to FILE instead of cache
+  -o FILE      Write binary to FILE instead of /tmp/ cache
   -p PKG       Download package (e.g. -p rsc.io/quote@v1.5.2)
   ...          Any go build flag (e.g. -tags, -ldflags)
 
 Environment:
   GO            = go
   GOO_CACHE     = mtime  (mtime|md5|none)
+  TMPDIR        = /tmp (override for temp files)
 ```
 
 ## cproto
@@ -183,10 +202,13 @@ validate() <examples/cflow.c:26>
 ## cindent
 
 Format C code to 1TBS style (4-space indent, braces on same line).
+Uses clang-format by default, or GNU indent with `-g`.
 
 ```sh
 $ cindent examples/cindent.c           # to stdout
 $ cindent -i src/*.c                   # in place
+$ cindent -g examples/cindent.c        # GNU indent backend, to stdout
+$ cat foo.c | cindent                  # stdin to stdout
 ```
 
 ## draft/cinclude
@@ -249,5 +271,8 @@ validate   function   examples/cflow.c   40   reference
 
 - C compiler, `cc` or `$CC`
 - POSIX shell, `sed`, `md5sum`, `gawk`
-- Analysis tools: `clang`, `jq`
-- Formatting: `clang-format`, `indent`
+- `clang`, `jq` (cproto, cflow, cinclude, cdeadl, cstruct, cxref)
+- `clang-format` or `indent` (cindent)
+- `gcc` (clint)
+- `go` (goo)
+- `pkg-config` (ccraft -p)
