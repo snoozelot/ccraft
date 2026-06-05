@@ -8,6 +8,7 @@ C development tools.
 - [ccompile](#ccompile) — batch compile, quiet on success
 - [clint](#clint) — lint C scripts
 - [goo](#goo) — run Go files as scripts
+- [goon](#goon) — discover and run Go projects
 - [cproto](#cproto) — extract function prototypes
 - [cdecl](#cdecl) — explain C declarations
 - [cflow](#cflow) — function call tree
@@ -71,7 +72,9 @@ Caching:
   none    Always recompile
 ```
 
-The `hi-*.c` files are self-contained templates to embed in your project without ccraft dependency.
+The `hi-*.c` and `hi-*.go` files are self-contained templates to embed in
+your project without depending on the ccraft/goo toolset. Each file has a
+bash wrapper that handles compilation and a cache strategy (mtime, md5, none).
 
 ## ccompile
 
@@ -100,12 +103,13 @@ $ clint script.c
 
 ## goo
 
-Run Go files as scripts with caching and automatic dependency resolution.
-Script mode: single-file programs with inline // go get directives, no go.mod needed.
-Project mode: auto-discovers main() package. Both modes cache the binary.
+Run a single `.go` file as a script. No go.mod needed.
+
+Creates an ephemeral module, resolves `// go get` directives and `-p` deps,
+caches the binary in `/tmp/`. Shebang support: `./script.go` works.
 
 ```go
-#!/usr/bin/env -S goo -vv
+#!/usr/bin/env -S goo
 // go get rsc.io/quote@v1.5.2
 
 package main
@@ -120,41 +124,44 @@ func main() {
 ```sh
 $ chmod +x hello.go
 $ ./hello.go
-```
-
-```sh
-$ goo hello.go                # script mode, same effect
-$ goo .                       # project mode, finds go.mod
-$ goo . -flag arg             # pass args to the program
-$ goo -m main.go              # file as project entry point
+$ goo hello.go                # same effect
+$ goo -v hello.go             # show build commands
+$ goo -p rsc.io/quote hello.go  # dep from flag
 $ cat script.go | goo /dev/stdin
 ```
 
-Script mode (`FILE.go`): creates a temp module, runs `go get` for `// go get`
-directives and `-p` specs, builds. Binary in /tmp/goo-HASH.bin, module dir
-cleaned. No go.mod touched. Shebang lines work the same as ccraft — mark
-the file executable and run directly.
+Local packages in the source file's directory are importable as `goo/PACKAGE`.
+Use `-I DIR` to add more directories:
 
-Project mode (`DIR` or `-m`): finds go.mod, runs `go mod tidy` (on rebuild),
-builds the package.
-
+```sh
+$ goo -I ../lib script.go     # import "goo/mylib"
 ```
-$ goo -h
-Usage: goo [FLAGS] [FILE.go|DIR] [ARG...]
 
-Options:
-  -m           Project mode (use go.mod, build the package)
-  -v           Show build commands
-  -vv          Also show source code (script mode only)
-  -o FILE      Write binary to FILE instead of /tmp/ cache
-  -p PKG       Download package (e.g. -p rsc.io/quote@v1.5.2)
-  ...          Any go build flag (e.g. -tags, -ldflags)
+Cache strategies: `GOO_CACHE=mtime` (default), `md5`, `none`.
 
-Environment:
-  GO            = go
-  GOO_CACHE     = mtime  (mtime|md5|none)
-  TMPDIR        = /tmp (override for temp files)
+See `goo -h` for full options.
+
+## goon
+
+Run a Go project from any subdirectory. No need to remember `./cmd/server` paths.
+
+Walks up from DIR to find `go.mod`, discovers the `main()` package, runs
+`go mod tidy` on rebuild, caches the binary in `/tmp/`.
+
+```sh
+$ goon .                      # discover and run from current dir
+$ goon -v .                   # show build commands
+$ goon ./cmd/server           # explicit subdirectory
+$ goon -m main.go             # file as project entry point
+$ goon -o /tmp/myapp .        # write binary to specific path
 ```
+
+Cache strategies: `GOON_CACHE=mtime` (default), `md5`, `none`.
+
+See `goon -h` for full options.
+
+The `hi-*.go` files are self-contained templates (bash wrapper + Go source
+in one file), one per cache strategy. Copy, chmod, run — no goo/goon needed.
 
 ## cproto
 
@@ -274,5 +281,5 @@ validate   function   examples/cflow.c   40   reference
 - `clang`, `jq` (cproto, cflow, cinclude, cdeadl, cstruct, cxref)
 - `clang-format` or `indent` (cindent)
 - `gcc` (clint)
-- `go` (goo)
+- `go` (goo, goon)
 - `pkg-config` (ccraft -p)
