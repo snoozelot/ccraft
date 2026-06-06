@@ -36,6 +36,11 @@
 #   goo -I ../lib script.go
 #   cat script.go | goo /dev/stdin
 #
+# EXIT CODES
+#   0       Program ran successfully
+#   1       Usage error, file not found, or build failure
+#   *       Exit code from the executed binary
+#
 # DEPENDENCIES
 #   go (or $GO)
 
@@ -45,13 +50,15 @@ SCRIPT=${0##*/}
 die() { echo "$SCRIPT: $*" >&2; exit 1; }
 in_dir() ( DIR=$1; shift; cd "$DIR" && "$@" )
 has_binary() { [[ -x "$OUT" ]]; }
-has_deps()   { grep -q '^// go get ' "$TARGET" 2>/dev/null || [[ ${#GO_GET_DEPS[@]} -gt 0 ]]; }
+has_deps()   { grep -q '^// go get ' "$SOURCE" 2>/dev/null || [[ ${#GO_GET_DEPS[@]} -gt 0 ]]; }
 is_verbose()    { (( V_FLAG >= 1 )); }
 is_very_verbose(){ (( V_FLAG >= 2 )); }
 
+# ============================================================================
+# Execution helpers
+# ============================================================================
 trace()   { if is_verbose; then set -x; "$@"; { set +x; } 2>/dev/null; else "$@"; fi; }
 cleanup() { rm -rf -- "${CLEANUP[@]}"; }
-
 quiet() {
     if is_verbose; then trace "$@"; else
         local CAPTURED STATUS
@@ -61,16 +68,20 @@ quiet() {
     fi
 }
 
+# ============================================================================
+# Cache
+# ============================================================================
+
 # Cache key: md5 hashes content, mtime/none hashes path. Deps + includes included.
 cache_key() {
     case ${CACHE_MODE:=mtime} in
         md5)
-            { id -u; cat "$TARGET"
+            { id -u; cat "$SOURCE"
               for s in "${GO_GET_DEPS[@]}"; do echo "$s"; done
               for d in "${INCLUDE_DIRS[@]}"; do find "$d" -name '*.go' -exec cat {} +; done
             } ;;
         *)
-            { id -u; readlink -f "$TARGET"
+            { id -u; readlink -f "$SOURCE"
               for s in "${GO_GET_DEPS[@]}"; do echo "$s"; done
               for d in "${INCLUDE_DIRS[@]}"; do echo "$d"; done
             } ;;
@@ -81,7 +92,7 @@ needs_rebuild() {
     if ! has_binary; then return 0; fi
     case $CACHE_MODE in
         none)  return 0 ;;
-        mtime) [[ "$TARGET" -nt "$OUT" ]] && return 0
+        mtime) [[ "$SOURCE" -nt "$OUT" ]] && return 0
                for d in "${INCLUDE_DIRS[@]}"; do
                    find "$d" -name '*.go' -newer "$OUT" -print -quit 2>/dev/null | grep -q . && return 0
                done
@@ -90,22 +101,31 @@ needs_rebuild() {
     esac
 }
 
-# Read stdin into temp file for compilation.
+# ============================================================================
+# Source preparation
+# ============================================================================
+
+# Capture stdin into temp file for compilation.
+# SIDEFF: sets SOURCE, appends to CLEANUP
 capture_stdin() {
-    TARGET=$(mktemp /tmp/goo-XXXXX.go)
-    CLEANUP+=("$TARGET"); trap cleanup EXIT
-    cat > "$TARGET"
-    [[ -s "$TARGET" ]] || die "stdin empty"
+    SOURCE=$(mktemp /tmp/goo-XXXXX.go)
+    CLEANUP+=("$SOURCE")
+    cat > "$SOURCE"
+    [[ -s "$SOURCE" ]] || die "stdin empty"
 }
 
 # Strip shebang, copy to module dir, show source if -vv.
 prepare_source() {
-    sed '1s|#!|//|' < "$TARGET" > "$1/main.go"
+    sed '1s|#!|//|' < "$SOURCE" > "$1/main.go"
     if is_very_verbose; then
         bat --language=go --number --paging=never "$1/main.go" 1>&2 2>/dev/null ||
         cat -n "$1/main.go" 1>&2
     fi
 }
+
+# ============================================================================
+# Dependencies
+# ============================================================================
 
 # Symlink Go packages from include dirs into the build module root.
 # Each subdirectory containing .go files becomes importable as goo/SUBDIR.
@@ -126,43 +146,30 @@ link_includes() {
 resolve_deps() {
     while IFS= read -r LINE; do
         in_dir "$1" quiet "${GO-go}" get "${LINE#// go get }"
-    done < <(grep '^// go get ' "$TARGET" || :)
+    done < <(grep '^// go get ' "$SOURCE" || :)
     for SPEC in "${GO_GET_DEPS[@]}"; do
         in_dir "$1" quiet "${GO-go}" get "$SPEC"
     done
 }
 
-# Build script: temp module, deps, includes, compile to $OUT.
-build_script() {
-    local DIR
-    DIR=$(mktemp -d /tmp/goo-XXXXX)
-    CLEANUP+=("$DIR"); trap cleanup EXIT
-
-    prepare_source "$DIR"
-    link_includes "$DIR" "${INCLUDE_DIRS[@]}"
-    in_dir "$DIR" quiet "${GO-go}" mod init goo 2>/dev/null
-    if has_deps; then resolve_deps "$DIR"; fi
-    in_dir "$DIR" trace "${GO-go}" build -buildvcs=false -o "$OUT" .
-}
-
-# Execute compiled binary with program args.
-# xtrace re-enabled if verbose so exec/exit are visible.
-# errexit off — exec returns binary's status, set -e hides xtrace of exit.
-exec_binary() {
-    { set +x; } 2>/dev/null
-    if is_verbose; then set -x; fi
-    { set +e; } 2>/dev/null
-
-    (exec -a "$TARGET" "$OUT" "$@")
-    exit $?
-}
-
 # ============================================================================
 main() {
-    local TARGET GO_GET_DEPS CLEANUP V_FLAG CACHE_MODE SCOPE_ID OUT INCLUDE_DIRS
+    local TARGET
+    local SOURCE
+    local GO_GET_DEPS
+    local CLEANUP
+    local V_FLAG
+    local CACHE_MODE
+    local SCOPE_ID
+    local OUT
+    local INCLUDE_DIRS
 
-    V_FLAG=0; GO_GET_DEPS=(); CLEANUP=(); INCLUDE_DIRS=()
+    V_FLAG=0
+    GO_GET_DEPS=()
+    CLEANUP=()
+    INCLUDE_DIRS=()
     CACHE_MODE=${GOO_CACHE:-mtime}
+    trap cleanup EXIT
 
     while [[ ${1:-} == -* ]]; do
         case $1 in
@@ -178,19 +185,34 @@ main() {
     done
 
     TARGET=$1; shift 2>/dev/null || :
+    SOURCE=$TARGET
 
     if [[ $TARGET == /dev/stdin ]]; then capture_stdin; fi
-    [[ -f "$TARGET" ]] || die "usage: $SCRIPT [-v|-vv] [-p PKG...] [-I DIR...] FILE.go [ARG...]"
+    [[ -f "$SOURCE" ]] || die "usage: $SCRIPT [-v|-vv] [-p PKG...] [-I DIR...] FILE.go [ARG...]"
 
     # Auto-include source file's directory, then explicit -I dirs
-    INCLUDE_DIRS=("$(dirname "$(readlink -f "$TARGET")")" "${INCLUDE_DIRS[@]}")
+    INCLUDE_DIRS=("$(dirname "$(readlink -f "$SOURCE")")" "${INCLUDE_DIRS[@]}")
 
     SCOPE_ID=$(cache_key)
     OUT=/tmp/goo-${SCOPE_ID}.bin
 
-    if needs_rebuild; then build_script; fi
+    if needs_rebuild; then
+        local DIR
+        DIR=$(mktemp -d /tmp/goo-XXXXX)
+        CLEANUP+=("$DIR")
+        prepare_source "$DIR"
+        link_includes "$DIR" "${INCLUDE_DIRS[@]}"
+        in_dir "$DIR" quiet "${GO-go}" mod init goo 2>/dev/null
+        if has_deps; then resolve_deps "$DIR"; fi
+        in_dir "$DIR" trace "${GO-go}" build -buildvcs=false -o "$OUT" .
+    fi
 
-    exec_binary "$@"
+    # Execute — errexit off so exec returns binary's status
+    { set +x; } 2>/dev/null
+    if is_verbose; then set -x; fi
+    { set +e; } 2>/dev/null
+    (exec -a "$TARGET" "$OUT" "$@")
+    exit $?
 }
 
 main "$@"

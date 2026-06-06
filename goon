@@ -32,9 +32,18 @@
 #   goon -m main.go
 #   goon -o /tmp/myapp .
 #
+# EXIT CODES
+#   0       Program ran successfully
+#   1       Usage error, no main package found, or project error
+#   *       Exit code from the executed binary
+#
 # DEPENDENCIES
 #   go (or $GO)
 #   git (for walking up from subdirectory)
+#
+# NOTES
+#   Unknown flags are passed through to go build, e.g.
+#   goon -ldflags="-s -w" .
 
 set -e
 
@@ -86,19 +95,24 @@ die_ambiguous() {
 
 # List all main() packages in the module. Die if zero or multiple.
 list_main_packages() {
-    local MODROOT=$1 ENTRIES
+    local MODROOT
+    local ENTRIES
+    local BASE
+
+    MODROOT=$1
+    BASE=$(basename "$MODROOT")
     ENTRIES=$(
         in_dir "$MODROOT" "${GO-go}" list -buildvcs=false \
             -f '{{if eq .Name "main"}}{{.Dir}}{{end}}' ./... 2>/dev/null
     )
-    got "$ENTRIES" || die "no main packages in $(basename "$MODROOT")"
+    got "$ENTRIES" || die "no main packages in $BASE"
     echo "$ENTRIES"
 }
 
 # From a list of main packages, pick one. Die if multiple.
 pick_main() {
     local MODROOT=$1 SCOPE=$2; shift 2
-    if [[ $# -eq 1 ]]; then echo "$1"; return; fi
+    if [[ $# -eq 1 ]]; then echo "$1"; return 0; fi
     die_ambiguous "$MODROOT" "$SCOPE" "$@"
 }
 
@@ -110,7 +124,7 @@ main_under_dir() {
 
     if in_dir "$MODROOT" "${GO-go}" list -buildvcs=false \
         -f '{{.Name}}' "./$REL" 2>/dev/null | grep -q '^main$'; then
-        echo "$DIR"; return
+        echo "$DIR"; return 0
     fi
 
     ENTRIES=$(
@@ -125,6 +139,7 @@ main_under_dir() {
 # Cache helpers
 # ============================================================================
 
+# SIDEFF: sets ALL_GO_FILES for cache_key and needs_rebuild
 collect_go_files() {
     ALL_GO_FILES=()
     while IFS= read -r -d '' f; do
@@ -154,6 +169,7 @@ needs_rebuild() {
 }
 
 cache_name() {
+    # SIDEFF: sets FILE for main() to use in OUT path
     local BASE
     BASE=$(basename "$1")
     if is_at_root; then FILE="proj-$BASE"
@@ -164,38 +180,28 @@ cache_name() {
 }
 
 # ============================================================================
-# Build
-# ============================================================================
-
-build_project() {
-    local REL_PATH
-    if is_at_root; then REL_PATH="."
-    else REL_PATH="${PKG_DIR#"$MODROOT"/}"
-    fi
-    in_dir "$MODROOT" quiet "${GO-go}" mod tidy
-    in_dir "$MODROOT" trace "${GO-go}" build -buildvcs=false \
-        "${GO_FLAGS_USER[@]}" -o "$OUT" "./$REL_PATH"
-}
-
-# ============================================================================
-# Execution
-# ============================================================================
-
-exec_binary() {
-    { set +x; } 2>/dev/null
-    if is_verbose; then set -x; fi
-    { set +e; } 2>/dev/null
-    (exec -a "$TARGET" "$OUT" "$@")
-    exit $?
-}
-
-# ============================================================================
 main() {
-    local TARGET V_FLAG M_FLAG GO_FLAGS_USER OUT CACHE_MODE \
-          ALL_GO_FILES MODROOT PKG_DIR FILE SCOPE_ID
+    local TARGET
+    local V_FLAG
+    local M_FLAG
+    local GO_FLAGS_USER
+    local OUT
+    local CACHE_MODE
+    local ALL_GO_FILES
+    local MODROOT
+    local PKG_DIR
+    local FILE
+    local SCOPE_ID
 
-    V_FLAG=0; M_FLAG=0; GO_FLAGS_USER=(); OUT=""
-    ALL_GO_FILES=(); MODROOT=; PKG_DIR=; FILE=; SCOPE_ID=
+    V_FLAG=0
+    M_FLAG=0
+    GO_FLAGS_USER=()
+    OUT=""
+    ALL_GO_FILES=()
+    MODROOT=
+    PKG_DIR=
+    FILE=
+    SCOPE_ID=
     CACHE_MODE=${GOON_CACHE:-mtime}
 
     while [[ ${1:-} == -* ]]; do
@@ -213,8 +219,8 @@ main() {
     got "$TARGET" || usage
 
     # Resolve target → MODROOT + PKG_DIR
+    local TARGET_DIR
     if [[ -d "$TARGET" ]]; then
-        local TARGET_DIR
         TARGET_DIR=$(cd "$TARGET" && pwd) || die "cannot resolve $TARGET"
         MODROOT=$(find_modroot "$TARGET_DIR") || die "no go.mod from $TARGET up to git root or /"
         if [[ $TARGET_DIR == "$MODROOT" ]]; then
@@ -223,7 +229,6 @@ main() {
             PKG_DIR=$(main_under_dir "$MODROOT" "$TARGET_DIR")
         fi
     elif has_m_flag && [[ -f "$TARGET" ]]; then
-        local TARGET_DIR
         TARGET_DIR=$(dirname "$(readlink -f "$TARGET")") || die "cannot resolve $TARGET"
         MODROOT=$(find_modroot "$TARGET_DIR") || die "no go.mod from $TARGET_DIR up to git root or /"
         PKG_DIR=$TARGET_DIR
@@ -237,9 +242,22 @@ main() {
     SCOPE_ID=$(cache_key)
     OUT=${OUT:-${TMPDIR-/tmp}/goon-${FILE}-${SCOPE_ID}.bin}
 
-    if needs_rebuild; then build_project; fi
+    if needs_rebuild; then
+        local REL_PATH
+        if is_at_root; then REL_PATH="."
+        else REL_PATH="${PKG_DIR#"$MODROOT"/}"
+        fi
+        in_dir "$MODROOT" quiet "${GO-go}" mod tidy
+        in_dir "$MODROOT" trace "${GO-go}" build -buildvcs=false \
+            "${GO_FLAGS_USER[@]}" -o "$OUT" "./$REL_PATH"
+    fi
 
-    exec_binary "$@"
+    # Execute — errexit off so exec returns binary's status
+    { set +x; } 2>/dev/null
+    if is_verbose; then set -x; fi
+    { set +e; } 2>/dev/null
+    (exec -a "$TARGET" "$OUT" "$@")
+    exit $?
 }
 
 main "$@"

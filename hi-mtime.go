@@ -14,11 +14,11 @@ if [[ ! -x "${OUT}" ]] || [[ "${FILE}" -nt "${OUT}" ]]; then
     bat --language=go --number --paging=never --line-range="$(( CLINE + 1 )):" "${DIR}/main.go" 2>/dev/null ||
     cat -n "${DIR}/main.go" | tail -n +"$(( CLINE + 1 ))" 2>/dev/null
 
-    cd "${DIR}"
+    cd "${DIR}" || exit 1
     set -x
-    "${GO-go}" mod init "${BASE%.go}" 2>/dev/null
-    "${GO-go}" mod tidy 2>&1
-    "${GO-go}" build -buildvcs=false -o "${OUT}" . 1>&2
+    if [[ -o xtrace ]]; then "${GO-go}" mod init "${BASE%.go}";              else "${GO-go}" mod init "${BASE%.go}" 2>/dev/null;              fi
+    if [[ -o xtrace ]]; then "${GO-go}" mod tidy 2>&1;                       else "${GO-go}" mod tidy 2>/dev/null;                            fi
+    if [[ -o xtrace ]]; then "${GO-go}" build -buildvcs=false -o "${OUT}" .; else "${GO-go}" build -buildvcs=false -o "${OUT}" . 2>/dev/null; fi || exit 1
 fi
 
 (exec -a "${FILE}" "${OUT}" "${@}")

@@ -126,7 +126,7 @@ $ chmod +x hello.go
 $ ./hello.go
 $ goo hello.go                # same effect
 $ goo -v hello.go             # show build commands
-$ goo -p rsc.io/quote hello.go  # dep from flag
+$ goo -p rsc.io/quote@v1.5.2 hello.go  # dep from flag
 $ cat script.go | goo /dev/stdin
 ```
 
