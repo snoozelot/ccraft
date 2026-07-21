@@ -62,7 +62,7 @@ cleanup() { rm -rf -- "${CLEANUP[@]}"; }
 quiet() {
     if is_verbose; then trace "$@"; else
         local CAPTURED STATUS
-        CAPTURED=$("$@" 2>&1); STATUS=$?
+        CAPTURED=$("$@" 2>&1) && STATUS=0 || STATUS=$?
         if (( STATUS != 0 )); then echo "+ $*" >&2; echo "$CAPTURED" >&2; fi
         return "$STATUS"
     fi
