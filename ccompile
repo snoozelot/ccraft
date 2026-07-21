@@ -32,6 +32,10 @@
 #   ccompile -o myprog main.c       # single file, custom output name
 #   ccompile -v -d build src/*.c    # verbose, see full compiler commands
 #
+# EXIT CODES
+#   0   All files compiled successfully
+#   1   Any file failed to compile, or usage error
+#
 # ENVIRONMENT
 #   CC        Compiler (default: cc)
 #   CFLAGS    Compiler flags (default: -O2 -Wall -Wextra)
@@ -41,6 +45,7 @@
 # DEPENDENCIES
 #   cc, or $CC
 #   pkg-config, if -p used
+#   nugget, if -R used
 
 set -eu
 
@@ -50,7 +55,9 @@ CFLAGS=${CFLAGS:--O2 -Wall -Wextra}
 has_arguments() { [ $# -gt 0 ]; }
 is_single()     { [ $# -eq 1 ]; }
 is_verbose()    { [ -n "${VERBOSE:-}" ]; }
-failed()        { [ "${1:-0}" -ne 0 ]; }
+failed()          { [ "${1:-0}" -ne 0 ]; }
+is_elf()          { file -b "$1" 2>/dev/null | grep -q '^ELF '; }
+has_remote_deps() { [ -n "${REMOTE_DEPS:-}" ]; }
 
 die()   { echo "ccompile: $*" >&2; exit 1; }
 usage() { die "Usage: ccompile [-d DIR] [-o FILE] [-v] FILE.c..."; }
@@ -62,17 +69,35 @@ output_path() {
     echo "${SRC%.c}"
 }
 
-# Sets CFLAGS_SHEBANG (before source) and LDFLAGS_SHEBANG (after source) from shebang line.
-# Only -o is skipped — ccompile controls output path.
+# Parse shebang and // ccraft, /* ccraft */, // ccompile, /* ccompile */ annotations.
 parse_flags() {
-    CFLAGS_SHEBANG= LDFLAGS_SHEBANG= STD_FLAG=${STD_FLAG:--std=gnu99}
-    LINE=$(head -1 "$1")
-    case $LINE in
-        '#!'*ccraft*  ) expand_flags ${LINE#*ccraft}   ;;
-        '//'*ccompile*) expand_flags ${LINE#*ccompile} ;;
-        '/*'*ccompile*) LINE=${LINE%\*/};
-                        expand_flags ${LINE#*ccompile} ;;
-    esac
+    CFLAGS_SHEBANG= LDFLAGS_SHEBANG= STD_FLAG=${STD_FLAG:--std=gnu99} REMOTE_DEPS=
+
+    while IFS= read -r LINE; do
+        case $LINE in
+            '#!'*ccraft*)
+                FLAGS=${LINE#*ccraft}
+                expand_quoted "$FLAGS" ;;
+            '// ccraft '*)
+                expand_quoted "${LINE#*ccraft }" ;;
+            '/* ccraft '*)
+                LINE=${LINE%\*/}
+                expand_quoted "${LINE#*ccraft }" ;;
+            '// ccompile '*)
+                expand_quoted "${LINE#*ccompile }" ;;
+            '/* ccompile '*)
+                LINE=${LINE%\*/}
+                expand_quoted "${LINE#*ccompile }" ;;
+            '//'*)  ;;
+            '/*'*)  break ;;
+            *)      break ;;
+        esac
+    done < "$1"
+}
+
+expand_quoted() {
+    eval "set -- $1"
+    expand_flags "$@"
 }
 
 expand_flags() {
@@ -85,6 +110,10 @@ expand_flags() {
                  LDFLAGS_SHEBANG="$LDFLAGS_SHEBANG $(pkg-config --libs   "${1#-p}" 2>/dev/null)" || die "pkg-config: ${1#-p}"
                  shift ;;
             -std=*) STD_FLAG=$1; shift ;;
+            -R)  REMOTE_DEPS="$REMOTE_DEPS $2"; shift 2 ;;
+            -R*) REMOTE_DEPS="$REMOTE_DEPS ${1#-R}"; shift ;;
+            -I)  CFLAGS_SHEBANG="$CFLAGS_SHEBANG -I$2"; shift 2 ;;
+            -I*) CFLAGS_SHEBANG="$CFLAGS_SHEBANG $1"; shift ;;
             -v|-vv) shift ;;   # ccraft verbosity, not a compiler flag
             -o)  shift 2 ;;    # ccompile controls output path
             -o*) shift ;;      # ccompile controls output path
@@ -102,12 +131,34 @@ report_failure() {
 
 compile() {
     SRC=$1 OUT=$2
+
+    if [ -e "$OUT" ] && ! is_elf "$OUT"; then
+        die "refusing to overwrite non-ELF: $OUT"
+    fi
+
     parse_flags "$SRC"
     RC=0
+
+    if has_remote_deps; then
+        NUGGET_DIR="$TMPDIR/nugget"
+        mkdir -p "$NUGGET_DIR"
+        for URL in $REMOTE_DEPS; do
+            NUGGET=$(command -v nugget) || {
+                NUGGET_TOOL="${TMPDIR}/nugget-tool"
+                command -v curl >/dev/null 2>&1 || die "curl required to download nugget"
+                curl -fsSL -o "$NUGGET_TOOL" \
+                    https://raw.githubusercontent.com/snoozelot/denim/master/screws/nugget
+                chmod +x "$NUGGET_TOOL"
+                NUGGET="$NUGGET_TOOL"
+            }
+            "$NUGGET" -o "$NUGGET_DIR" "$URL" >/dev/null 2>&1 || die "nugget: $URL"
+        done
+    fi
 
     SRCDIR=$(dirname "$(readlink -f "$SRC" 2>/dev/null || echo "$SRC")")
 
     CC_ALL="$STD_FLAG -I$SRCDIR $CFLAGS $CFLAGS_SHEBANG"
+    if has_remote_deps; then CC_ALL="$CC_ALL -I$TMPDIR"; fi
     LD_ALL="$LDFLAGS_SHEBANG ${LDFLAGS:-}"
 
     if is_verbose; then echo "$CC $CC_ALL -o $OUT $SRC $LD_ALL" >&2; fi
