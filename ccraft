@@ -112,10 +112,11 @@ fetch_remote_dep() {
     NUGGET=$(command -v nugget) || {
         NUGGET=${TMPDIR-/tmp}/ccraft-nugget
         command -v curl >/dev/null 2>&1 || die "curl required to download nugget"
+
+        if wants_trace; then printf "+ fetched nugget\n" >&2; fi
         curl -fsSL -o "$NUGGET" \
             https://raw.githubusercontent.com/snoozelot/denim/master/screws/nugget
         chmod +x "$NUGGET"
-        if wants_trace; then printf "+ fetched nugget\n" >&2; fi
     }
 
     mkdir -p "$NUGGET_DIR"
@@ -146,12 +147,11 @@ dispatch_flag() {
 }
 
 dispatch_line() {
-    local I=0
-    read -ra ARGS <<< "$1"
+    eval "set -- $1"
 
-    while [[ $I -lt ${#ARGS[@]} ]]; do
-        dispatch_flag "${ARGS[I]}" "${ARGS[I+1]-}"
-        I=$((I + 1 + DISPATCH_CONSUMED))
+    while [[ $# -gt 0 ]]; do
+        dispatch_flag "$1" "${2-}"
+        shift $((1 + DISPATCH_CONSUMED))
     done
 }
 
@@ -170,7 +170,6 @@ parse_annotations() {
             '/* ccompile '*)
                 local BODY=${LINE#*ccompile }
                 dispatch_line "${BODY%\*/}" ;;
-            '')     ;;
             '//'*)  ;;
             '/*'*)  break ;;
             *)      break ;;
@@ -275,8 +274,6 @@ FILE_C=$1; shift
 if is_stdin; then
     FILE_C="${TMPDIR-/tmp}/ccraft-$$.c"
     cat > "$FILE_C"
-    CLEANUP+=("$FILE_C")
-    trap 'rm -rf -- "${CLEANUP[@]}"' EXIT
     [[ -s $FILE_C ]] || die "stdin is empty"
     FILE="stdin"
 else
@@ -288,27 +285,39 @@ SCOPE_ID=$(scope_id "$FILE_C")
 STEM=${TMPDIR-/tmp}/ccraft-${SCOPE_ID}
 STEM_D=${STEM}.d
 NUGGET_DIR=${STEM_D}/nugget
+TMP_C="${STEM_D}/src.c"
+
+if [[ $FILE == "stdin" ]]; then
+    mkdir -p "$STEM_D"
+    mv "$FILE_C" "$TMP_C"
+    FILE_C="/dev/stdin"
+    CLEANUP+=("$STEM_D")
+    trap 'rm -rf -- "${CLEANUP[@]}"' EXIT
+fi
 
 if no "$OUT"; then OUT=$STEM; fi
 
 if needs_recompile; then
     mkdir -p "$STEM_D"
     CLEANUP+=("$STEM_D")
+    if [[ $CACHE_MODE == "none" ]]; then CLEANUP+=("$OUT"); fi
     trap 'rm -rf -- "${CLEANUP[@]}"' EXIT
-    SRC_CLEAN="${STEM_D}/src.c"
 
-    parse_annotations "$FILE_C"
+    if [[ $FILE != "stdin" ]]; then
+        cp "$FILE_C" "$TMP_C"
+    fi
+
+    parse_annotations "$TMP_C"
 
     for URL in "${CC_REMOTE_DEPS[@]}"; do
         fetch_remote_dep "$URL"
     done
     [[ ${#CC_REMOTE_DEPS[@]} -gt 0 ]] && CC_FLAGS_USER+=("-I$STEM_D")
-
-    sed "1 s|^#!.*|#line 2 \"$FILE_C\"|" < "$FILE_C" > "$SRC_CLEAN"
+    sed -i "1 s|^#!.*|#line 2 \"$FILE_C\"|" "$TMP_C"
 
     if wants_source; then
-        bat --language=C --number --paging=never "$SRC_CLEAN"  1>&2 2>/dev/null ||
-        cat -vn "$SRC_CLEAN" 1>&2 2>/dev/null
+        bat --language=C --number --paging=never "$TMP_C"  1>&2 2>/dev/null ||
+        cat -vn "$TMP_C" 1>&2 2>/dev/null
     fi
 
     CC_FLAGS=(
@@ -321,7 +330,7 @@ if needs_recompile; then
     )
 
     if wants_trace; then set -x; fi
-    "${CC-cc}" "${CC_FLAGS[@]}" -o"$OUT" "$SRC_CLEAN" "${LD_FLAGS_USER[@]}" >&2
+    "${CC-cc}" "${CC_FLAGS[@]}" -o"$OUT" "$TMP_C" "${LD_FLAGS_USER[@]}" >&2
 fi
 
 { set +x; } 2>/dev/null
