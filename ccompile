@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/usr/bin/env bash
 # ccompile — batch compile C files with chronic-style output
 #
 # WHAT IT DOES
@@ -52,42 +52,65 @@ set -eu
 CC=${CC:-cc}
 CFLAGS=${CFLAGS:--O2 -Wall -Wextra}
 
-has_arguments() { [ $# -gt 0 ]; }
-is_single()     { [ $# -eq 1 ]; }
-is_verbose()    { [ -n "${VERBOSE:-}" ]; }
-failed()          { [ "${1:-0}" -ne 0 ]; }
-is_elf()          { file -b "$1" 2>/dev/null | grep -q '^ELF '; }
-has_remote_deps() { [ -n "${REMOTE_DEPS:-}" ]; }
+# ============================================================================
+# Helpers
+# ============================================================================
 
 die()   { echo "ccompile: $*" >&2; exit 1; }
 usage() { die "Usage: ccompile [-d DIR] [-o FILE] [-v] FILE.c..."; }
+no()    { [[ -z $1 ]]; }
+got()   { [[ -n $1 ]]; }
+
+# ============================================================================
+# Predicates
+# ============================================================================
+
+has_arguments()    { [[ $# -gt 0 ]]; }
+is_single()        { [[ $# -eq 1 ]]; }
+is_verbose()       { [[ -n ${VERBOSE:-} ]]; }
+succeeded()        { [[ $1 -eq 0 ]]; }
+is_elf()           { file -b "$1" 2>/dev/null | grep -q '^ELF '; }
+has_remote_deps()  { [[ -n ${REMOTE_DEPS:-} ]]; }
+safe_to_overwrite(){ ! [[ -e $1 ]] || is_elf "$1"; }
+
+# ============================================================================
+# Output path resolution
+# ============================================================================
 
 output_path() {
-    SRC=$1 OUTDIR=$2 OUTFILE=$3
-    if [ -n "$OUTFILE" ]; then echo "$OUTFILE"; return; fi
-    if [ -n "$OUTDIR" ]; then echo "$OUTDIR/$(basename "${SRC%.c}")"; return; fi
+    local SRC=$1 OUTDIR=$2 OUTFILE=$3
+
+    if got "$OUTFILE"; then echo "$OUTFILE"; return; fi
+    if got "$OUTDIR"; then echo "$OUTDIR/$(basename "${SRC%.c}")"; return; fi
     echo "${SRC%.c}"
 }
 
-# Parse shebang and // ccraft, /* ccraft */, // ccompile, /* ccompile */ annotations.
+# ============================================================================
+# Annotation parsing — extract flags from shebang and // comments
+# ============================================================================
+
 parse_flags() {
-    CFLAGS_SHEBANG= LDFLAGS_SHEBANG= STD_FLAG=${STD_FLAG:--std=gnu99} REMOTE_DEPS=
+    local LINE
+
+    CFLAGS_SHEBANG=""
+    LDFLAGS_SHEBANG=""
+    STD_FLAG=${STD_FLAG:--std=gnu99}
+    REMOTE_DEPS=""
 
     while IFS= read -r LINE; do
         case $LINE in
             '#!'*ccraft*)
-                FLAGS=${LINE#*ccraft}
-                expand_quoted "$FLAGS" ;;
+                expand_quoted "${LINE#*ccraft}" ;;
             '// ccraft '*)
                 expand_quoted "${LINE#*ccraft }" ;;
             '/* ccraft '*)
-                LINE=${LINE%\*/}
-                expand_quoted "${LINE#*ccraft }" ;;
+                local BODY=${LINE#*ccraft }; BODY=${BODY%\*/}
+                expand_quoted "$BODY" ;;
             '// ccompile '*)
                 expand_quoted "${LINE#*ccompile }" ;;
             '/* ccompile '*)
-                LINE=${LINE%\*/}
-                expand_quoted "${LINE#*ccompile }" ;;
+                local BODY=${LINE#*ccompile }; BODY=${BODY%\*/}
+                expand_quoted "$BODY" ;;
             '//'*)  ;;
             '/*'*)  break ;;
             *)      break ;;
@@ -101,28 +124,58 @@ expand_quoted() {
 }
 
 expand_flags() {
-    while [ $# -gt 0 ]; do
+    while [[ $# -gt 0 ]]; do
+        CONSUMED=1
         case $1 in
             -p)  CFLAGS_SHEBANG="$CFLAGS_SHEBANG $(pkg-config --cflags "$2" 2>/dev/null)" || die "pkg-config: $2"
                  LDFLAGS_SHEBANG="$LDFLAGS_SHEBANG $(pkg-config --libs   "$2" 2>/dev/null)" || die "pkg-config: $2"
-                 shift 2 ;;
+                 CONSUMED=2 ;;
             -p*) CFLAGS_SHEBANG="$CFLAGS_SHEBANG $(pkg-config --cflags "${1#-p}" 2>/dev/null)" || die "pkg-config: ${1#-p}"
-                 LDFLAGS_SHEBANG="$LDFLAGS_SHEBANG $(pkg-config --libs   "${1#-p}" 2>/dev/null)" || die "pkg-config: ${1#-p}"
-                 shift ;;
-            -std=*) STD_FLAG=$1; shift ;;
-            -R)  REMOTE_DEPS="$REMOTE_DEPS $2"; shift 2 ;;
-            -R*) REMOTE_DEPS="$REMOTE_DEPS ${1#-R}"; shift ;;
-            -I)  CFLAGS_SHEBANG="$CFLAGS_SHEBANG -I$2"; shift 2 ;;
-            -I*) CFLAGS_SHEBANG="$CFLAGS_SHEBANG $1"; shift ;;
-            -v|-vv) shift ;;   # ccraft verbosity, not a compiler flag
-            -o)  shift 2 ;;    # ccompile controls output path
-            -o*) shift ;;      # ccompile controls output path
-            -l*) LDFLAGS_SHEBANG="$LDFLAGS_SHEBANG $1"; shift ;;   # libs must follow source
-            *)   CFLAGS_SHEBANG="$CFLAGS_SHEBANG $1"; shift ;;
+                 LDFLAGS_SHEBANG="$LDFLAGS_SHEBANG $(pkg-config --libs   "${1#-p}" 2>/dev/null)" || die "pkg-config: ${1#-p}" ;;
+            -l*) LDFLAGS_SHEBANG="$LDFLAGS_SHEBANG $1" ;;
+            -I)  CFLAGS_SHEBANG="$CFLAGS_SHEBANG -I$2"; CONSUMED=2 ;;
+            -I*) CFLAGS_SHEBANG="$CFLAGS_SHEBANG $1" ;;
+            -R)  REMOTE_DEPS="$REMOTE_DEPS $2"; CONSUMED=2 ;;
+            -R*) REMOTE_DEPS="$REMOTE_DEPS ${1#-R}" ;;
+            -std=*) STD_FLAG=$1 ;;
+            -v|-vv) ;;     # verbosity, not a compiler flag
+            -o)  CONSUMED=2 ;;  # ccompile controls output path
+            -o*) ;;             # -oFILE form
+            *)   CFLAGS_SHEBANG="$CFLAGS_SHEBANG $1" ;;
         esac
+        shift $CONSUMED
     done
 }
 
+# ============================================================================
+# Remote dependencies — fetch header-only libraries via nugget
+# ============================================================================
+
+fetch_remote_dep() {
+    local URL=$1
+    local NUGGET
+
+    NUGGET=$(command -v nugget) || {
+        NUGGET="${TMPDIR}/nugget-tool"
+
+        [[ -x $NUGGET ]] || {
+            command -v curl >/dev/null 2>&1 || die "curl required to download nugget"
+            curl -fsSL -o "$NUGGET" \
+                https://raw.githubusercontent.com/snoozelot/denim/master/screws/nugget
+            chmod +x "$NUGGET"
+        }
+    }
+
+    mkdir -p "$NUGGET_DIR"
+    "$NUGGET" -o "$NUGGET_DIR" "$URL" >/dev/null 2>&1 || die "nugget: $URL"
+}
+
+# ============================================================================
+# Compilation
+# ============================================================================
+
+# SRC is from the caller's scope (bash dynamic scope).
+# Used by report_failure to label which file failed.
 report_failure() {
     echo "=== FAILED: $SRC ===" >&2
     cat "$TMPDIR/out"
@@ -130,11 +183,14 @@ report_failure() {
 }
 
 compile() {
-    SRC=$1 OUT=$2
+    local SRC=$1
+    local OUT=$2
+    local RC
+    local SRCDIR
+    local CC_ALL
+    local LD_ALL
 
-    if [ -e "$OUT" ] && ! is_elf "$OUT"; then
-        die "refusing to overwrite non-ELF: $OUT"
-    fi
+    safe_to_overwrite "$OUT" || die "refusing to overwrite non-ELF: $OUT"
 
     parse_flags "$SRC"
     RC=0
@@ -142,16 +198,9 @@ compile() {
     if has_remote_deps; then
         NUGGET_DIR="$TMPDIR/nugget"
         mkdir -p "$NUGGET_DIR"
+
         for URL in $REMOTE_DEPS; do
-            NUGGET=$(command -v nugget) || {
-                NUGGET_TOOL="${TMPDIR}/nugget-tool"
-                command -v curl >/dev/null 2>&1 || die "curl required to download nugget"
-                curl -fsSL -o "$NUGGET_TOOL" \
-                    https://raw.githubusercontent.com/snoozelot/denim/master/screws/nugget
-                chmod +x "$NUGGET_TOOL"
-                NUGGET="$NUGGET_TOOL"
-            }
-            "$NUGGET" -o "$NUGGET_DIR" "$URL" >/dev/null 2>&1 || die "nugget: $URL"
+            fetch_remote_dep "$URL"
         done
     fi
 
@@ -159,6 +208,7 @@ compile() {
 
     CC_ALL="$STD_FLAG -I$SRCDIR $CFLAGS $CFLAGS_SHEBANG"
     if has_remote_deps; then CC_ALL="$CC_ALL -I$TMPDIR"; fi
+
     LD_ALL="$LDFLAGS_SHEBANG ${LDFLAGS:-}"
 
     if is_verbose; then echo "$CC $CC_ALL -o $OUT $SRC $LD_ALL" >&2; fi
@@ -166,13 +216,19 @@ compile() {
     sed "1 s|^#!.*|#line 2 \"$SRC\"|" "$SRC" > "$TMPDIR/src.c"
     $CC $CC_ALL -o "$OUT" "$TMPDIR/src.c" $LD_ALL >"$TMPDIR/out" 2>"$TMPDIR/err" || RC=$?
 
-    if failed "$RC"; then report_failure; fi
+    succeeded "$RC" || report_failure
     return $RC
 }
 
 compile_all() {
-    OUTDIR=$1 OUTFILE=$2; shift 2
-    TOTAL=$# N=0 FAIL=0
+    local OUTDIR=$1
+    local OUTFILE=$2
+    shift 2
+    local TOTAL=$#
+    local N=0
+    local FAIL=0
+    local SRC
+    local OUT
 
     for SRC in "$@"; do
         N=$((N + 1))
@@ -180,13 +236,20 @@ compile_all() {
         echo "[$N/$TOTAL] $CC $SRC -o $OUT"
         compile "$SRC" "$OUT" || FAIL=1
     done
+
     return $FAIL
 }
 
-main() {
-    OUTDIR= OUTFILE= VERBOSE=
+# ============================================================================
+# Main
+# ============================================================================
 
-    while [ $# -gt 0 ]; do
+main() {
+    local OUTDIR=""
+    local OUTFILE=""
+    local VERBOSE=""
+
+    while [[ $# -gt 0 ]]; do
         case $1 in
             -d) OUTDIR=$2; shift 2 ;;
             -o) OUTFILE=$2; shift 2 ;;
@@ -198,7 +261,10 @@ main() {
     done
 
     has_arguments "$@" || usage
-    [ -z "$OUTFILE" ] || is_single "$@" || die "-o invalid with multiple files"
+
+    if got "$OUTFILE" && ! is_single "$@"; then
+        die "-o invalid with multiple files"
+    fi
 
     TMPDIR=$(mktemp -d)
     trap 'rm -rf "$TMPDIR"' EXIT INT TERM HUP

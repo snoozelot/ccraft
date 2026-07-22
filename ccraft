@@ -98,12 +98,25 @@ SCRIPT=${0##*/}
 die() { echo "${SCRIPT}: $*" >&2; exit 1; }
 no()  { [[ -z $1 ]]; }
 
-has_flag()        { [[ ${1:-} == -* ]]; }
-is_stdin()        { [[ $FILE_C == "/dev/stdin" ]]; }
-wants_trace()     { [[ $V_FLAG -ge 1 ]]; }
-wants_source()    { [[ $V_FLAG -ge 2 ]]; }
-binary_missing()  { [[ ! -x $OUT ]]; }
-source_newer()    { [[ $FILE_C -nt $OUT ]]; }
+# ============================================================================
+# Predicates
+# ============================================================================
+
+has_flag()          { [[ ${1:-} == -* ]]; }
+is_stdin()          { [[ $FILE_C == "/dev/stdin" ]]; }
+stdin_path()        { [[ $FILE == "stdin" ]]; }
+wants_trace()       { [[ $V_FLAG -ge 1 ]]; }
+wants_source()     { [[ $V_FLAG -ge 2 ]]; }
+has_binary()        { [[ -x $OUT ]]; }
+source_newer()      { [[ $FILE_C -nt $OUT ]]; }
+source_readable()   { [[ -r $1 ]]; }
+stdin_has_data()    { [[ -s $1 ]]; }
+cache_disabled()    { [[ $CACHE_MODE == "none" ]]; }
+has_remote_deps()   { [[ ${#CC_REMOTE_DEPS[@]} -gt 0 ]]; }
+
+# ============================================================================
+# Remote dependencies — fetch header-only libraries via nugget
+# ============================================================================
 
 fetch_remote_dep() {
     local URL=$1
@@ -111,9 +124,10 @@ fetch_remote_dep() {
 
     NUGGET=$(command -v nugget) || {
         NUGGET=${TMPDIR-/tmp}/ccraft-nugget
-        command -v curl >/dev/null 2>&1 || die "curl required to download nugget"
 
+        command -v curl >/dev/null 2>&1 || die "curl required to download nugget"
         if wants_trace; then printf "+ fetched nugget\n" >&2; fi
+
         curl -fsSL -o "$NUGGET" \
             https://raw.githubusercontent.com/snoozelot/denim/master/screws/nugget
         chmod +x "$NUGGET"
@@ -125,21 +139,26 @@ fetch_remote_dep() {
     "$NUGGET" -o "$NUGGET_DIR" "$URL" >/dev/null || die "nugget failed: $URL"
 }
 
-DISPATCH_CONSUMED=0
+# ============================================================================
+# Flag dispatch — parses CC flags from CLI and // annotations
+# ============================================================================
+
+# Sets CONSUMED to 1 (single-arg flag) or 2 (two-arg flag like -p PKG).
+# Side effects: appends to CC_FLAGS_USER, LD_FLAGS_USER, CC_REMOTE_DEPS.
 dispatch_flag() {
-    DISPATCH_CONSUMED=0
+    CONSUMED=1
     case $1 in
         -p)  read -ra CC_FLAGS_PKGCONFIG < <(pkg-config --cflags "$2")
              read -ra CC_LIBS_PKGCONFIG  < <(pkg-config --libs   "$2")
              CC_FLAGS_USER+=("${CC_FLAGS_PKGCONFIG[@]}"); LD_FLAGS_USER+=("${CC_LIBS_PKGCONFIG[@]}")
-             DISPATCH_CONSUMED=1 ;;
+             CONSUMED=2 ;;
         -p*) read -ra CC_FLAGS_PKGCONFIG < <(pkg-config --cflags "${1#-p}")
              read -ra CC_LIBS_PKGCONFIG  < <(pkg-config --libs   "${1#-p}")
              CC_FLAGS_USER+=("${CC_FLAGS_PKGCONFIG[@]}"); LD_FLAGS_USER+=("${CC_LIBS_PKGCONFIG[@]}") ;;
         -l*) LD_FLAGS_USER+=("$1") ;;
-        -I)  CC_FLAGS_USER+=("-I$2"); DISPATCH_CONSUMED=1 ;;
+        -I)  CC_FLAGS_USER+=("-I$2"); CONSUMED=2 ;;
         -I*) CC_FLAGS_USER+=("$1") ;;
-        -R)  CC_REMOTE_DEPS+=("$2"); DISPATCH_CONSUMED=1 ;;
+        -R)  CC_REMOTE_DEPS+=("$2"); CONSUMED=2 ;;
         -R*) CC_REMOTE_DEPS+=("${1#-R}") ;;
         -std=*) STD_FLAG=$1 ;;
         *)   CC_FLAGS_USER+=("$1") ;;
@@ -150,8 +169,9 @@ dispatch_line() {
     eval "set -- $1"
 
     while [[ $# -gt 0 ]]; do
+        CONSUMED=1
         dispatch_flag "$1" "${2-}"
-        shift $((1 + DISPATCH_CONSUMED))
+        shift $CONSUMED
     done
 }
 
@@ -177,27 +197,34 @@ parse_annotations() {
     done < <(tail -n +2 "$FILE")
 }
 
+# ============================================================================
+# Cache — compute scope ID, decide if recompile needed
+# ============================================================================
+
 scope_id() {
     case $CACHE_MODE in
-        md5)   { id -u; cat "$1"; } | md5sum | head -c8 ;;
-        mtime) { id -u; readlink -f "$1" 2>/dev/null || echo "$1"; } | md5sum | head -c8 ;;
-        none)  { id -u; readlink -f "$1" 2>/dev/null || echo "$1"; } | md5sum | head -c8 ;;
+        md5) { id -u; cat "$1"; } | md5sum | head -c8 ;;
+        *)   { id -u; readlink -f "$1" 2>/dev/null || echo "$1"; } | md5sum | head -c8 ;;
     esac
 }
 
 needs_recompile() {
     case $CACHE_MODE in
         none)  return 0 ;;
-        mtime) binary_missing || source_newer ;;
-        md5)   binary_missing ;;
+        mtime) ! has_binary || source_newer ;;
+        md5)   ! has_binary ;;
     esac
 }
+
+# ============================================================================
+# Build helpers
+# ============================================================================
 
 include_dir() {
     local REAL
 
     REAL=$(readlink -f "$FILE_C" 2>/dev/null || echo "$FILE_C")
-    if [[ $FILE == "stdin" ]]; then pwd; else dirname "$REAL"; fi
+    if stdin_path; then pwd; else dirname "$REAL"; fi
 }
 
 # ============================================================================
@@ -264,17 +291,17 @@ while has_flag "$1"; do
         -o)     OUT=$2;          shift 2 ;;
         -o*)    OUT=${1#-o};     shift   ;;
         -std=*) STD_FLAG=$1;     shift   ;;
-        *)      dispatch_flag "$1" "${2-}"; shift $((1 + DISPATCH_CONSUMED)) ;;
+        *)      CONSUMED=1; dispatch_flag "$1" "${2-}"; shift $CONSUMED ;;
     esac
 done
 
-[[ -r ${1:-} ]] || { usage; exit 1; }
+source_readable "${1:-}" || { usage; exit 1; }
 FILE_C=$1; shift
 
 if is_stdin; then
-    FILE_C="${TMPDIR-/tmp}/ccraft-$$.c"
+    FILE_C=${TMPDIR-/tmp}/ccraft-$$.c
     cat > "$FILE_C"
-    [[ -s $FILE_C ]] || die "stdin is empty"
+    stdin_has_data "$FILE_C" || die "stdin is empty"
     FILE="stdin"
 else
     FILE=${FILE_C##*/}
@@ -285,9 +312,9 @@ SCOPE_ID=$(scope_id "$FILE_C")
 STEM=${TMPDIR-/tmp}/ccraft-${SCOPE_ID}
 STEM_D=${STEM}.d
 NUGGET_DIR=${STEM_D}/nugget
-TMP_C="${STEM_D}/src.c"
+TMP_C=${STEM_D}/src.c
 
-if [[ $FILE == "stdin" ]]; then
+if stdin_path; then
     mkdir -p "$STEM_D"
     mv "$FILE_C" "$TMP_C"
     FILE_C="/dev/stdin"
@@ -300,10 +327,10 @@ if no "$OUT"; then OUT=$STEM; fi
 if needs_recompile; then
     mkdir -p "$STEM_D"
     CLEANUP+=("$STEM_D")
-    if [[ $CACHE_MODE == "none" ]]; then CLEANUP+=("$OUT"); fi
+    if cache_disabled; then CLEANUP+=("$OUT"); fi
     trap 'rm -rf -- "${CLEANUP[@]}"' EXIT
 
-    if [[ $FILE != "stdin" ]]; then
+    if ! stdin_path; then
         cp "$FILE_C" "$TMP_C"
     fi
 
@@ -312,7 +339,8 @@ if needs_recompile; then
     for URL in "${CC_REMOTE_DEPS[@]}"; do
         fetch_remote_dep "$URL"
     done
-    [[ ${#CC_REMOTE_DEPS[@]} -gt 0 ]] && CC_FLAGS_USER+=("-I$STEM_D")
+
+    if has_remote_deps; then CC_FLAGS_USER+=("-I$STEM_D"); fi
     sed -i "1 s|^#!.*|#line 2 \"$FILE_C\"|" "$TMP_C"
 
     if wants_source; then
