@@ -109,7 +109,7 @@ Environment:
 Use with `-R` pointing to the raw file:
 
 ```c
-// ccraft -R https://raw.githubusercontent.com/snoozelot/ccraft/main/reef/tt.h
+// ccraft -R https://raw.githubusercontent.com/snoozelot/ccraft/master/reef/tt.h
 #include "nugget/tt.h"
 
 TEST(math) {
