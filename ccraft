@@ -87,7 +87,7 @@
 #include <sys/stat.h>    /* File status and permissions */
 #include <fcntl.h>       /* File control options */
 #
-set -e
+set -euo pipefail
 
 # ============================================================================
 # Helpers
@@ -275,95 +275,99 @@ EOS
 # Main
 # ============================================================================
 
-V_FLAG=0
-STD_FLAG="-std=gnu99"
-CC_FLAGS_USER=()
-LD_FLAGS_USER=()
-OUT=""
-CLEANUP=()
-CACHE_MODE=${CCRAFT_CACHE-mtime}
-CC_REMOTE_DEPS=()
+main() {
+    V_FLAG=0
+    STD_FLAG="-std=gnu99"
+    CC_FLAGS_USER=()
+    LD_FLAGS_USER=()
+    OUT=""
+    CLEANUP=()
+    CACHE_MODE=${CCRAFT_CACHE-mtime}
+    CC_REMOTE_DEPS=()
 
-while has_flag "$1"; do
-    case $1 in
-        -v)     ((V_FLAG+=1));   shift   ;;
-        -vv)    ((V_FLAG+=2));   shift   ;;
-        -o)     OUT=$2;          shift 2 ;;
-        -o*)    OUT=${1#-o};     shift   ;;
-        -std=*) STD_FLAG=$1;     shift   ;;
-        *)      CONSUMED=1; dispatch_flag "$1" "${2-}"; shift $CONSUMED ;;
-    esac
-done
-
-source_readable "${1:-}" || { usage; exit 1; }
-FILE_C=$1; shift
-
-if is_stdin; then
-    FILE_C=${TMPDIR-/tmp}/ccraft-$$.c
-    cat > "$FILE_C"
-    stdin_has_data "$FILE_C" || die "stdin is empty"
-    FILE="stdin"
-else
-    FILE=${FILE_C##*/}
-    FILE=${FILE%.[ct]}
-fi
-
-SCOPE_ID=$(scope_id "$FILE_C")
-STEM=${TMPDIR-/tmp}/ccraft-${SCOPE_ID}
-STEM_D=${STEM}.d
-NUGGET_DIR=${STEM_D}/nugget
-TMP_C=${STEM_D}/src.c
-
-if stdin_path; then
-    mkdir -p "$STEM_D"
-    mv "$FILE_C" "$TMP_C"
-    FILE_C="/dev/stdin"
-    CLEANUP+=("$STEM_D")
-    trap 'rm -rf -- "${CLEANUP[@]}"' EXIT
-fi
-
-if no "$OUT"; then OUT=$STEM; fi
-
-if needs_recompile; then
-    mkdir -p "$STEM_D"
-    CLEANUP+=("$STEM_D")
-    if cache_disabled; then CLEANUP+=("$OUT"); fi
-    trap 'rm -rf -- "${CLEANUP[@]}"' EXIT
-
-    if ! stdin_path; then
-        cp "$FILE_C" "$TMP_C"
-    fi
-
-    parse_annotations "$TMP_C"
-
-    for URL in "${CC_REMOTE_DEPS[@]}"; do
-        fetch_remote_dep "$URL"
+    while has_flag "${1:-}"; do
+        case $1 in
+            -v)     ((V_FLAG+=1));   shift   ;;
+            -vv)    ((V_FLAG+=2));   shift   ;;
+            -o)     OUT=$2;          shift 2 ;;
+            -o*)    OUT=${1#-o};     shift   ;;
+            -std=*) STD_FLAG=$1;     shift   ;;
+            *)      CONSUMED=1; dispatch_flag "$1" "${2-}"; shift $CONSUMED ;;
+        esac
     done
 
-    if has_remote_deps; then CC_FLAGS_USER+=("-I$STEM_D"); fi
-    sed -i "1 s|^#!.*|#line 2 \"$FILE_C\"|" "$TMP_C"
+    source_readable "${1:-}" || { usage; exit 1; }
+    FILE_C=$1; shift
 
-    if wants_source; then
-        bat --language=C --number --paging=never "$TMP_C"  1>&2 2>/dev/null ||
-        cat -vn "$TMP_C" 1>&2 2>/dev/null
+    if is_stdin; then
+        FILE_C=${TMPDIR-/tmp}/ccraft-$$.c
+        cat > "$FILE_C"
+        stdin_has_data "$FILE_C" || die "stdin is empty"
+        FILE="stdin"
+    else
+        FILE=${FILE_C##*/}
+        FILE=${FILE%.[ct]}
     fi
 
-    CC_FLAGS=(
-        "$STD_FLAG"
-        -O0 -pipe
-        -I"$(include_dir)"
-        -Wall -Wextra -Wno-unused
-        -Wl,-O1
-        "${CC_FLAGS_USER[@]}"
-    )
+    SCOPE_ID=$(scope_id "$FILE_C")
+    STEM=${TMPDIR-/tmp}/ccraft-${SCOPE_ID}
+    STEM_D=${STEM}.d
+    NUGGET_DIR=${STEM_D}/nugget
+    TMP_C=${STEM_D}/src.c
 
+    if stdin_path; then
+        mkdir -p "$STEM_D"
+        mv "$FILE_C" "$TMP_C"
+        FILE_C="/dev/stdin"
+        CLEANUP+=("$STEM_D")
+        trap 'rm -rf -- "${CLEANUP[@]}"' EXIT
+    fi
+
+    if no "$OUT"; then OUT=$STEM; fi
+
+    if needs_recompile; then
+        mkdir -p "$STEM_D"
+        CLEANUP+=("$STEM_D")
+        if cache_disabled; then CLEANUP+=("$OUT"); fi
+        trap 'rm -rf -- "${CLEANUP[@]}"' EXIT
+
+        if ! stdin_path; then
+            cp "$FILE_C" "$TMP_C"
+        fi
+
+        parse_annotations "$TMP_C"
+
+        for URL in "${CC_REMOTE_DEPS[@]}"; do
+            fetch_remote_dep "$URL"
+        done
+
+        if has_remote_deps; then CC_FLAGS_USER+=("-I$STEM_D"); fi
+        sed -i "1 s|^#!.*|#line 2 \"$FILE_C\"|" "$TMP_C"
+
+        if wants_source; then
+            bat --language=C --number --paging=never "$TMP_C"  1>&2 2>/dev/null ||
+            cat -vn "$TMP_C" 1>&2 2>/dev/null
+        fi
+
+        CC_FLAGS=(
+            "$STD_FLAG"
+            -O0 -pipe
+            -I"$(include_dir)"
+            -Wall -Wextra -Wno-unused
+            -Wl,-O1
+            "${CC_FLAGS_USER[@]}"
+        )
+
+        if wants_trace; then set -x; fi
+        "${CC-cc}" "${CC_FLAGS[@]}" -o"$OUT" "$TMP_C" "${LD_FLAGS_USER[@]}" >&2
+    fi
+
+    { set +x; } 2>/dev/null
     if wants_trace; then set -x; fi
-    "${CC-cc}" "${CC_FLAGS[@]}" -o"$OUT" "$TMP_C" "${LD_FLAGS_USER[@]}" >&2
-fi
+    { set +e; } 2>/dev/null
 
-{ set +x; } 2>/dev/null
-if wants_trace; then set -x; fi
-{ set +e; } 2>/dev/null
+    (exec -a "$FILE_C" "$OUT" "$@")
+    exit $?
+}
 
-(exec -a "$FILE_C" "$OUT" "$@")
-exit $?
+main "$@"

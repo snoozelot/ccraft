@@ -4,24 +4,30 @@ C development tools.
 
 ## Tools
 
-- [ccraft](#ccraft-1) — run C files as scripts
-- [ccompile](#ccompile) — batch compile, quiet on success
-- [clint](#clint) — lint C scripts
-- [goo](#goo) — run Go files as scripts
-- [goon](#goon) — discover and run Go projects
-- [cproto](#cproto) — extract function prototypes
-- [cdecl](#cdecl) — explain C declarations
-- [cflow](#cflow) — function call tree
-- [cindent](#cindent) — format to 1TBS style
-- [draft/cinclude](#draftcinclude) — include dependency tree
-- [draft/cdeadl](#draftcdeadl) — detect deadlocks
-- [draft/cstruct](#draftcstruct) — show struct layout with padding
-- [draft/cxref](#draftcxref) — cross-reference symbols
+| Tool | Purpose |
+|------|---------|
+| [`ccraft`](ccraft) | Run C files as scripts |
+| [`ccompile`](ccompile) | Batch compile, quiet on success |
+| [`clint`](clint) | Lint C scripts |
+| [`goo`](goo) | Run Go files as scripts |
+| [`goon`](goon) | Discover and run Go projects |
+| [`cproto`](cproto) | Extract function prototypes |
+| [`cdecl`](cdecl) | Explain C declarations |
+| [`cflow`](cflow) | Function call tree |
+| [`cindent`](cindent) | Format to 1TBS style |
+| [`draft/cinclude`](draft/cinclude) | Include dependency tree |
+| [`draft/cdeadl`](draft/cdeadl) | Detect deadlocks |
+| [`draft/cstruct`](draft/cstruct) | Show struct layout with padding |
+| [`draft/cxref`](draft/cxref) | Cross-reference symbols |
+| [`reef/tt.h`](reef/tt.h) | Minimal C test framework (auto-registration, fork, concurrency, PARAMS) |
 
 ## ccraft
 
-Run C files as scripts. No Makefile, no autoconf, no CMake, just add shebang and execute.
+Run C files as scripts. No Makefile, no autoconf, no CMake — just add shebang and execute.
 Compiles on first run, caches the binary in /tmp/, recompiles when source changes.
+Also acts as package manager: `-R` fetches remote header-only libraries via nugget
+(auto-downloaded if missing). Additional flags can be embedded in `// ccraft` annotations.
+Bundled with [`reef/tt.h`](reef/tt.h) test framework.
 
 ```c
 #!/usr/bin/env -S ccraft -p libcurl
@@ -43,8 +49,86 @@ $ chmod +x fetch.c
 $ ./fetch.c https://example.com
 ```
 
+Remote deps via `-R`:
+
+```c
+// ccraft -R https://raw.githubusercontent.com/sheredom/utf8.h/main/utf8.h
+#include "nugget/utf8.h"
+
+int main(void) {
+    utf8_int32_t cp;
+    const char *s = "Hello";
+    s = (const char *)utf8codepoint((const utf8_int8_t *)s, &cp);
+    printf("first codepoint: U+%04X\n", cp);
+    return 0;
+}
 ```
-$ ccraft -h
+
+```sh
+$ ccraft -R https://raw.githubusercontent.com/sheredom/utf8.h/main/utf8.h utf8demo.c
+```
+
+Annotations embed flags in the source:
+
+```c
+// ccraft -p freetype2 -R https://raw.githubusercontent.com/sheredom/utf8.h/main/utf8.h
+#include FT_FREETYPE_H
+#include "nugget/utf8.h"
+// ...
+```
+
+```
+$ ccraft --help
+Usage: ccraft [CC_FLAG]... FILE_C [ARG]...
+
+Compile FILE_C and execute it with ARGs as arguments to the program.
+Caches binary in /tmp/ — silent on hit, rebuilds when source changes.
+Shebang: #!/usr/bin/env -S ccraft
+
+CC_FLAGs:
+  -v          Show compilation command
+  -vv         Show compilation command and source code (rebuild only)
+  -std=STD    Override gnu99 as C standard with STD
+  -o FILE     Write binary to FILE instead of /tmp/ cache
+  -p MODULE   Link against pkg-config MODULE, e.g. -p freetype2
+  -lLIB       Link library (compact form, e.g. -lm)
+  -R URL      Include from remote URL via nugget
+              #include "nugget/<repo>/header.h"
+  ...         Any other CC/LD flags
+
+  // ccraft FLAGS...  annotation lines after shebang (additional flags)
+
+Environment:
+  CC            = cc
+  CCRAFT_CACHE  = mtime  (mtime|md5|none)
+  TMPDIR        = /tmp (override for temp files)
+```
+
+## reef/tt.h
+
+Use with `-R` pointing to the raw file:
+
+```c
+// ccraft -R https://raw.githubusercontent.com/snoozelot/ccraft/main/reef/tt.h
+#include "nugget/tt.h"
+
+TEST(math) {
+    ASSERT_EQ("two_plus_two", 2 + 2, 4);
+}
+
+int main(int argc, char **argv) {
+    return tt_main(argc, argv);
+}
+```
+
+```sh
+$ ./test.t
+seed: 1234
+
+/math  [ OK ]  0.3 ms
+
+1/1 tests, 1/1 assertions in 0.3 ms
+```
 Usage: ccraft [CC_FLAG]... FILE_C [ARG]...
 
 Compile FILE_C and execute it with ARGs as arguments to the program.
@@ -274,12 +358,3 @@ validate   function   examples/cflow.c   40   reference
 ...
 ```
 
-## Dependencies
-
-- C compiler, `cc` or `$CC`
-- POSIX shell, `sed`, `md5sum`, `gawk`
-- `clang`, `jq` (cproto, cflow, cinclude, cdeadl, cstruct, cxref)
-- `clang-format` or `indent` (cindent)
-- `gcc` (clint)
-- `go` (goo, goon)
-- `pkg-config` (ccraft -p)
