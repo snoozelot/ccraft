@@ -45,9 +45,9 @@
 #   ccraft -lm calc.c "2 + 3"
 #   ccraft -p SDL2 game.c
 #   ccraft -R git+https://github.com/nothings/stb imgtool.c
-#               // #include "nugget/stb/stb_image.h"
+#             #include "nugget/stb/stb_image.h"
 #   ccraft -R https://raw.githubusercontent.com/user/lib/helper.h use.c
-#               // #include "nugget/helper.h"
+#             #include "nugget/helper.h"
 #   cat hello.c | ccraft /dev/stdin
 #
 # DEPENDENCIES

@@ -19,15 +19,13 @@ C development tools.
 | [`draft/cdeadl`](draft/cdeadl) | Detect deadlocks |
 | [`draft/cstruct`](draft/cstruct) | Show struct layout with padding |
 | [`draft/cxref`](draft/cxref) | Cross-reference symbols |
-| [`reef/tt.h`](reef/tt.h) | Minimal C test framework (auto-registration, fork, concurrency, PARAMS) |
+| [`reef/tt.h`](reef/tt.h) | Minimal C test framework |
 
 ## ccraft
 
-Run C files as scripts. No Makefile, no autoconf, no CMake — just add shebang and execute.
-Compiles on first run, caches the binary in /tmp/, recompiles when source changes.
-Also acts as package manager: `-R` fetches remote header-only libraries via nugget
-(auto-downloaded if missing). Additional flags can be embedded in `// ccraft` annotations.
-Bundled with [`reef/tt.h`](reef/tt.h) test framework.
+Run C files as scripts. No Makefile, no CMake — shebang and execute.
+Compiles on first run, caches in `/tmp/`, recompiles when source changes.
+`-R` fetches remote headers, `// ccraft` annotations embed extra flags.
 
 ```c
 #!/usr/bin/env -S ccraft -p libcurl
@@ -51,62 +49,35 @@ $ ./fetch.c https://example.com
 
 Remote deps via `-R`:
 
-```c
-// ccraft -R https://raw.githubusercontent.com/sheredom/utf8.h/main/utf8.h
-#include "nugget/utf8.h"
-
-int main(void) {
-    utf8_int32_t cp;
-    const char *s = "Hello";
-    s = (const char *)utf8codepoint((const utf8_int8_t *)s, &cp);
-    printf("first codepoint: U+%04X\n", cp);
-    return 0;
-}
-```
-
 ```sh
-$ ccraft -R https://raw.githubusercontent.com/sheredom/utf8.h/main/utf8.h utf8demo.c
+$ ccraft -R https://raw.githubusercontent.com/sheredom/utf8.h/main/utf8.h file.c
 ```
 
-Annotations embed flags in the source:
+Annotations embed flags in the source (after shebang), includes reference `"nugget/..."`:
 
 ```c
 // ccraft -p freetype2 -R https://raw.githubusercontent.com/sheredom/utf8.h/main/utf8.h
 #include FT_FREETYPE_H
 #include "nugget/utf8.h"
-// ...
 ```
 
+## ccompile
+
+Batch compile C files, quiet on success. Binary next to source unless `-d DIR` or `-o FILE`.
+
+```sh
+$ ccompile src/*.c              # src/foo → src/foo
+$ ccompile -d build src/*.c     # src/foo → build/foo
+$ ccompile -o server src/*.c    # single binary
 ```
-$ ccraft --help
-Usage: ccraft [CC_FLAG]... FILE_C [ARG]...
 
-Compile FILE_C and execute it with ARGs as arguments to the program.
-Caches binary in /tmp/ — silent on hit, rebuilds when source changes.
-Shebang: #!/usr/bin/env -S ccraft
+Flags embedded on line 1:
 
-CC_FLAGs:
-  -v          Show compilation command
-  -vv         Show compilation command and source code (rebuild only)
-  -std=STD    Override gnu99 as C standard with STD
-  -o FILE     Write binary to FILE instead of /tmp/ cache
-  -p MODULE   Link against pkg-config MODULE, e.g. -p freetype2
-  -lLIB       Link library (compact form, e.g. -lm)
-  -R URL      Include from remote URL via nugget
-              #include "nugget/<repo>/header.h"
-  ...         Any other CC/LD flags
-
-  // ccraft FLAGS...  annotation lines after shebang (additional flags)
-
-Environment:
-  CC            = cc
-  CCRAFT_CACHE  = mtime  (mtime|md5|none)
-  TMPDIR        = /tmp (override for temp files)
+```c
+// ccompile -lm -DDEBUG
 ```
 
 ## reef/tt.h
-
-Use with `-R` pointing to the raw file:
 
 ```c
 // ccraft -R https://raw.githubusercontent.com/snoozelot/ccraft/master/reef/tt.h
@@ -121,65 +92,11 @@ int main(int argc, char **argv) {
 }
 ```
 
-```sh
-$ ./test.t
-seed: 1234
-
-/math  [ OK ]  0.3 ms
-
-1/1 tests, 1/1 assertions in 0.3 ms
-```
-Usage: ccraft [CC_FLAG]... FILE_C [ARG]...
-
-Compile FILE_C and execute it with ARGs as arguments to the program.
-Caches binary in /tmp/ — silent on hit, rebuilds when source changes.
-When FILE_C is /dev/stdin, cwd is added as include path.
-When FILE_C is a regular file, its directory is added as include path.
-
-CC_FLAGs:
-  -v          Show compilation command
-  -vv         Show compilation command and source code (rebuild only)
-  -std=STD    Override gnu99 as C standard with STD
-  -o FILE     Write binary to FILE instead of /tmp/ cache
-  -p MODULE   Link against pkg-config MODULE, e.g. -p freetype2
-  -lLIB       Link library (compact form, e.g. -lm)
-  ...         Any other CC/LD flags
-
-Environment:
-  CC            = cc
-  CCRAFT_CACHE  = mtime  (mtime|md5|none)
-  TMPDIR        = /tmp (override for temp files)
-
-Caching:
-  mtime   Recompile when source newer than binary (default)
-  md5     Recompile when content hash changes
-  none    Always recompile
-```
-
-The `hi-*.c` and `hi-*.go` files are self-contained templates to embed in
-your project without depending on the ccraft/goo toolset. Each file has a
-bash wrapper that handles compilation and a cache strategy (mtime, md5, none).
-
-## ccompile
-
-Batch compile C files. Quiet on success (chronic-style), shows output only on failure. Binary goes next to source.
-Per-file compiler flags can be embedded on line 1 (shebang or comment).
-
-```sh
-$ ccompile src/*.c              # src/foo.c → src/foo
-$ ccompile -d build src/*.c     # src/foo.c → build/foo
-$ ccompile -o server src/*.c    # single binary
-```
-
-```c
-// ccompile -lm -DDEBUG
-#include <math.h>
-int main() { return (int)sqrt(4) - 2; }
-```
+The `hi-*.c` and `hi-*.go` files are standalone templates (bash wrapper + source, no ccraft/goo needed).
 
 ## clint
 
-Lint C scripts using gcc syntax-only mode.
+Lint C scripts via gcc syntax-only mode.
 
 ```sh
 $ clint script.c
@@ -188,9 +105,7 @@ $ clint script.c
 ## goo
 
 Run a single `.go` file as a script. No go.mod needed.
-
-Creates an ephemeral module, resolves `// go get` directives and `-p` deps,
-caches the binary in `/tmp/`. Shebang support: `./script.go` works.
+Ephemeral module, resolves `// go get` deps and `-p`, caches in `/tmp/`.
 
 ```go
 #!/usr/bin/env -S goo
@@ -208,57 +123,38 @@ func main() {
 ```sh
 $ chmod +x hello.go
 $ ./hello.go
-$ goo hello.go                # same effect
-$ goo -v hello.go             # show build commands
-$ goo -p rsc.io/quote@v1.5.2 hello.go  # dep from flag
 $ cat script.go | goo /dev/stdin
 ```
 
-Local packages in the source file's directory are importable as `goo/PACKAGE`.
-Use `-I DIR` to add more directories:
-
-```sh
-$ goo -I ../lib script.go     # import "goo/mylib"
-```
-
-Cache strategies: `GOO_CACHE=mtime` (default), `md5`, `none`.
-
-See `goo -h` for full options.
+Local packages in the source's directory importable as `goo/PACKAGE`. `-I DIR` adds more.
+Cache: `GOO_CACHE=mtime|md5|none`.
 
 ## goon
 
-Run a Go project from any subdirectory. No need to remember `./cmd/server` paths.
-
-Walks up from DIR to find `go.mod`, discovers the `main()` package, runs
-`go mod tidy` on rebuild, caches the binary in `/tmp/`.
+Run a Go project from any subdirectory. Finds `go.mod` upward, discovers `main()`, tidies on rebuild, caches in `/tmp/`.
 
 ```sh
-$ goon .                      # discover and run from current dir
+$ goon .                      # discover and run
 $ goon -v .                   # show build commands
-$ goon ./cmd/server           # explicit subdirectory
-$ goon -m main.go             # file as project entry point
-$ goon -o /tmp/myapp .        # write binary to specific path
+$ goon -m main.go             # file as entry point
+$ goon -o /tmp/app .          # write binary
 ```
 
-Cache strategies: `GOON_CACHE=mtime` (default), `md5`, `none`.
+Cache: `GOON_CACHE=mtime|md5|none`.
 
-See `goon -h` for full options.
-
-The `hi-*.go` files are self-contained templates (bash wrapper + Go source
-in one file), one per cache strategy. Copy, chmod, run — no goo/goon needed.
+The `hi-*.go` files are standalone templates (no goo/goon needed).
 
 ## cproto
 
-Extract function prototypes and type definitions from C source using clang AST.
-Generate complete header files with guards, forward declarations, and dependency-sorted types.
+Extract function prototypes and types via clang AST. Generate headers with guards.
 
 ```sh
-$ cproto src/parser.c                   # function prototypes only
-$ cproto -T src/parser.c                # include structs/enums/typedefs
-$ cproto -TgfS src/parser.c > parser.h  # full header with guards
+$ cproto src/parser.c                   # prototypes only
+$ cproto -T src/parser.c                # + structs/enums/typedefs
+$ cproto -TgfS src/parser.c > parser.h  # full header
 ```
 
-Options: `-s` static functions, `-T` types, `-g` guards, `-f` forward decls, `-S` sort by deps.
+Options: `-s` static, `-T` types, `-g` guards, `-f` forward decls, `-S` sort by deps.
 
 ## cdecl
 
@@ -267,94 +163,70 @@ Explain C declarations in plain English.
 ```sh
 $ cdecl 'int (*fp)(int, char)'
 fp is pointer to function (int, char) returning int
-
-$ cat examples/cdecl.txt | cdecl
 ```
 
 ## cflow
 
-Show function call tree. Forward from a root, or reverse to find callers.
+Call tree. Forward from root, `-R` for reverse (find callers).
 
 ```sh
 $ cflow examples/cflow.c
-main() <examples/cflow.c:56>
-    factorial() <examples/cflow.c:47>
-        factorial() [recursive]
+main()
+    factorial() [recursive]
     printf()
-    process() <examples/cflow.c:38>
+    process()
         ...
 
 $ cflow -R validate examples/cflow.c
-validate() <examples/cflow.c:26>
-    process() <examples/cflow.c:38>
-        main() <examples/cflow.c:56>
+validate()
+    process()
+        main()
 ```
 
 ## cindent
 
-Format C code to 1TBS style (4-space indent, braces on same line).
-Uses clang-format by default, or GNU indent with `-g`.
+Format C to 1TBS (4-space, brace on same line). clang-format by default, `-g` for GNU indent.
 
 ```sh
-$ cindent examples/cindent.c           # to stdout
-$ cindent -i src/*.c                   # in place
-$ cindent -g examples/cindent.c        # GNU indent backend, to stdout
-$ cat foo.c | cindent                  # stdin to stdout
+$ cindent file.c          # stdout
+$ cindent -i src/*.c      # in place
+$ cat foo.c | cindent     # stdin
 ```
 
 ## draft/cinclude
 
-Show include dependency tree.
+Include dependency tree.
 
 ```sh
-$ draft/cinclude -s -d 2 examples/cflow.c
-examples/cflow.c
-<stdio.h>                               → /usr/include/stdio.h
-    <bits/libc-header-start.h>          → /usr/include/bits/libc-header-start.h
-    <bits/types.h>                      → /usr/include/bits/types.h
-    ...
-<stdlib.h>                              → /usr/include/stdlib.h
-    ...
+$ draft/cinclude -s -d 2 file.c
 ```
 
 ## draft/cdeadl
 
-Detect potential deadlocks by analyzing lock acquisition order across functions.
+Detect deadlocks from lock acquisition order.
 
 ```sh
-$ draft/cdeadl examples/cdeadl.c
+$ draft/cdeadl file.c
 deadlock: Account.mu vs Config.mu
   Account.mu:54 → Config.mu:55
   Config.mu:92 → Account.mu:93
-
-deadlock: Account.mu → Logger.mu → Config.mu → Account.mu
-  Account.mu:72 → Logger.mu:73
-  ...
 ```
 
 ## draft/cstruct
 
-Annotate C source with struct memory layout. Shows field sizes, offsets, and padding waste.
+Annotate struct memory layout with sizes, offsets, padding.
 
 ```sh
-$ draft/cstruct examples/cstruct.c packet
-struct packet {                         /* 24 bytes, align 8 */
-    char type;                          /*  1 byte  @  0 bytes, 7 padding */
-    void *data;                         /*  8 bytes @  8 bytes */
-    short len;                          /*  2 bytes @ 16 bytes */
-    char flags;                         /*  1 byte  @ 18 bytes, 5 padding */
-};
+$ draft/cstruct file.c struct_name
 ```
 
 ## draft/cxref
 
-Cross-reference symbols: where every function, variable, type is defined and used.
+Cross-reference symbols: definition and usage locations.
 
 ```sh
-$ draft/cxref examples/cflow.c
-validate   function   examples/cflow.c   20   declaration
-validate   function   examples/cflow.c   26   definition
-validate   function   examples/cflow.c   40   reference
-...
+$ draft/cxref file.c
+validate   function   file.c   20   declaration
+validate   function   file.c   26   definition
+validate   function   file.c   40   reference
 ```
-
